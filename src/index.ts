@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { captureBaseline, createSkepticVerifier } from "./verifier.ts";
 
 const DEFAULT_MAX_TURNS = 20;
 // Identical gap fingerprints in a row before the goal auto-pauses.
@@ -20,6 +21,10 @@ export interface GoalState {
 	maxTurns: number;
 	/** User typed while active → stop auto-continuing until /goal resume. */
 	suspended: boolean;
+	/** Working directory captured at goal creation; the skeptic runs here. */
+	cwd: string;
+	/** `git rev-parse HEAD` at creation; the skeptic diffs against it. */
+	baselineCommit?: string;
 	lastGapFingerprint?: string;
 	lastGaps?: string[];
 	stallCount: number;
@@ -37,11 +42,8 @@ export interface GoalVerdict {
 
 export type GoalVerifier = (objective: string, round: number) => Promise<GoalVerdict>;
 
-// ponytail: v0.1 stub — never verifies, so goals can only exit via pause/clear
-// or the turn cap. Real execution-grounded skeptic (spawn `pi -p` with the
-// objective + git diff, parse a JSON verdict) lands next; the Verifier
-// interface is the seam.
-const stubVerifier: GoalVerifier = async () => ({ achieved: false, gaps: [], modelFixable: true });
+/** Builds the verifier for one goal (its cwd + baseline are baked in). */
+export type GoalVerifierFactory = (goal: GoalState) => GoalVerifier;
 
 function isPaused(status: GoalStatus): boolean {
 	return status !== "active" && status !== "complete";
@@ -70,8 +72,9 @@ interface SettleContext {
 	ui?: Ui;
 }
 
-export function createQuest(pi: ExtensionAPI, verify: GoalVerifier): void {
+export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory): void {
 	let goal: GoalState | undefined;
+	let verify: GoalVerifier | undefined;
 
 	function statusText(): string {
 		if (!goal) return "";
@@ -131,7 +134,7 @@ export function createQuest(pi: ExtensionAPI, verify: GoalVerifier): void {
 		// goal. The round counts as unverified, the loop continues.
 		let verdict: GoalVerdict | undefined;
 		try {
-			verdict = await verify(goal.objective, goal.round);
+			verdict = verify ? await verify(goal.objective, goal.round) : undefined;
 		} catch {
 			verdict = undefined;
 		}
@@ -233,6 +236,7 @@ export function createQuest(pi: ExtensionAPI, verify: GoalVerifier): void {
 				ctx.ui.notify("usage: /goal <objective> [--max-turns N]", "error");
 				return;
 			}
+			const baselineCommit = await captureBaseline((c, a, o) => pi.exec(c, a, o), ctx.cwd);
 			goal = {
 				objective: parsed.objective,
 				status: "active",
@@ -240,8 +244,11 @@ export function createQuest(pi: ExtensionAPI, verify: GoalVerifier): void {
 				autoTurns: 0,
 				maxTurns: parsed.maxTurns,
 				suspended: false,
+				cwd: ctx.cwd,
+				...(baselineCommit ? { baselineCommit } : {}),
 				stallCount: 0,
 			};
+			verify = makeVerifier(goal);
 			persist();
 			syncUi(ctx);
 			ctx.ui.notify(`🎯 goal set (cap ${goal.maxTurns} auto-continuations)`, "info");
@@ -282,14 +289,16 @@ export function createQuest(pi: ExtensionAPI, verify: GoalVerifier): void {
 			goal.status = "user_paused";
 			goal.pauseReason = "restored from a previous session";
 		}
+		verify = goal ? makeVerifier(goal) : undefined;
 		syncUi(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
 		goal = undefined;
+		verify = undefined;
 	});
 }
 
 export default function quest(pi: ExtensionAPI): void {
-	createQuest(pi, stubVerifier);
+	createQuest(pi, (goal) => createSkepticVerifier((c, a, o) => pi.exec(c, a, o), goal));
 }

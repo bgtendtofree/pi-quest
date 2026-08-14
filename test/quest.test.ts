@@ -35,6 +35,10 @@ function createPi(): {
 		appendEntry(customType: string, data: unknown) {
 			entries.push({ customType, data });
 		},
+		// Not a git repo in tests → baseline capture yields undefined.
+		exec() {
+			return Promise.resolve({ stdout: "", stderr: "not a repo", code: 128, killed: false });
+		},
 	} as unknown as ExtensionAPI;
 	return { pi, handlers, commands, sent, entries };
 }
@@ -56,7 +60,7 @@ function fixture(
 ): Fixture {
 	const { pi, handlers, commands, sent, entries } = createPi();
 	let call = 0;
-	createQuest(pi, async () => {
+	createQuest(pi, () => async () => {
 		const next = verdicts[Math.min(call, verdicts.length - 1)];
 		call += 1;
 		if (next instanceof Error) throw next;
@@ -65,6 +69,7 @@ function fixture(
 
 	const statuses: string[] = [];
 	const ctx = {
+		cwd: "/tmp/quest-test",
 		isIdle: () => true,
 		hasPendingMessages: () => opts?.pending ?? false,
 		ui: {
@@ -255,6 +260,7 @@ describe("persistence discipline", () => {
 			autoTurns: 2,
 			maxTurns: 20,
 			suspended: false,
+			cwd: "/tmp/quest-test",
 			stallCount: 0,
 		};
 		const f = fixture([], { entries: [{ customType: "pi-quest", data: stored }], startReason: "resume" });
@@ -272,6 +278,7 @@ describe("persistence discipline", () => {
 			autoTurns: 2,
 			maxTurns: 20,
 			suspended: false,
+			cwd: "/tmp/quest-test",
 			stallCount: 0,
 		};
 		const f = fixture([notDone()], { entries: [{ customType: "pi-quest", data: stored }], startReason: "reload" });

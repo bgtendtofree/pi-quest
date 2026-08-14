@@ -31,9 +31,15 @@ A goal restored from a previous session **never re-arms itself**: it comes back 
 
 ## Verification
 
-v0.1 ships the loop with a **stub verifier** — the `GoalVerifier` seam (`src/index.ts`) is where the execution-grounded skeptic lands next: spawn a `pi -p` subagent with the objective + `git diff` against the goal's baseline commit, parse a JSON verdict `{ achieved, gaps[], model_fixable }`. Design: [pi-doom-loop docs/goal-plugin-design.md](https://github.com/bgtendtofree/pi-doom-loop/blob/main/docs/goal-plugin-design.md).
+Every settled round spawns an **adversarial skeptic**: a fresh `pi --mode json -p --no-session` process (`src/verifier.ts`) that gets the objective plus `git diff` against the goal's baseline commit (captured at `/goal` time), re-runs the acceptance checks against the real worktree — tests, builds, scripts — and reports a strict JSON verdict:
 
-A broken verifier is fail-open: the round counts as unverified and the loop continues; an internal failure never blocks or silently completes a goal.
+```json
+{"achieved": false, "gaps": ["3 auth tests still fail"], "model_fixable": true, "blocker": null}
+```
+
+`achieved` completes the goal; `gaps` are inlined into the next continuation; `model_fixable: false` blocks it for a human decision. Identical gap sets twice in a row (normalized fingerprint) trip the no-progress pause. A skeptic that crashes, times out (10 min), or returns unparseable output is **fail-open**: the round counts as unverified and the loop continues — an internal failure never blocks or silently completes a goal.
+
+Design rationale: [pi-doom-loop docs/goal-plugin-design.md](https://github.com/bgtendtofree/pi-doom-loop/blob/main/docs/goal-plugin-design.md).
 
 ## Install
 
