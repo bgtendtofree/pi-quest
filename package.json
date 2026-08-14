@@ -1,0 +1,48 @@
+{
+	"name": "pi-quest",
+	"version": "0.1.0",
+	"description": "Persistent goals for Pi: set an objective, the agent loops until verified done, stalled, or capped",
+	"type": "module",
+	"license": "MIT",
+	"engines": {
+		"node": ">=24"
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-extension",
+		"goal",
+		"autonomous-agent"
+	],
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"typecheck": "tsc -p tsconfig.json",
+		"format": "biome format --write .",
+		"fix": "biome check --write .",
+		"quality": "biome ci .",
+		"test": "node --test",
+		"test:watch": "node --test --watch",
+		"test:coverage": "rm -rf coverage && mkdir -p coverage && node --test --experimental-test-coverage --test-coverage-include=\"src/**/*.ts\" --test-coverage-exclude=\"test/**/*.ts\" --test-coverage-lines=75 --test-coverage-functions=60 --test-coverage-branches=60 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info",
+		"smoke:package": "node scripts/smoke-package.mjs",
+		"validate": "npm run quality && npm run typecheck && npm test",
+		"ci": "npm run quality && npm run typecheck && npm run test:coverage && npm run smoke:package"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.4",
+		"@earendil-works/pi-coding-agent": "0.84.0",
+		"@types/node": "^24.0.0",
+		"typescript": "7.0.2"
+	}
+}

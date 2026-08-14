@@ -1,0 +1,15 @@
+[tools]
+node = "24.19.0"
+
+# >>> pi-ci-standard managed — regenerate with: pi-ci init >>>
+[tasks.check]
+description = "Iterative checks (npm run validate)"
+run = "npm run validate"
+
+[tasks.ci]
+description = "Full CI gate: fresh install, then npm run ci"
+run = '''
+npm ci
+npm run ci
+'''
+# <<< pi-ci-standard managed <<<
