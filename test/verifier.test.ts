@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { buildSkepticPrompt, parseVerdict } from "../src/verifier.ts";
+import type { GoalState } from "../src/index.ts";
+import { buildSkepticPrompt, createSkepticVerifier, type ExecFn, parseVerdict } from "../src/verifier.ts";
 
 describe("parseVerdict", () => {
 	test("parses the fenced json block", () => {
@@ -55,5 +56,70 @@ describe("buildSkepticPrompt", () => {
 		assert.match(prompt, /migrate auth/);
 		assert.match(prompt, /diff --git/);
 		assert.match(prompt, /adversarial verifier/i);
+	});
+});
+
+describe("skeptic worktree caching", () => {
+	const goal: GoalState = {
+		objective: "do the thing",
+		status: "active",
+		round: 0,
+		autoTurns: 0,
+		maxTurns: 20,
+		suspended: false,
+		cwd: "/tmp/x",
+		baselineCommit: "abc123",
+		stallCount: 0,
+	};
+
+	const verdictText = '```json\n{"achieved": false, "gaps": ["gap one"], "model_fixable": true}\n```';
+	const jsonl = `${JSON.stringify({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: verdictText }] },
+	})}\n`;
+
+	function mockExec(tree: { status: string; diff: string }): { exec: ExecFn; spawns: () => number } {
+		let spawns = 0;
+		const exec: ExecFn = async (command, args) => {
+			if (command === "git") {
+				const isStatus = args.includes("status");
+				return { stdout: isStatus ? tree.status : tree.diff, stderr: "", code: 0, killed: false };
+			}
+			spawns += 1;
+			return { stdout: jsonl, stderr: "", code: 0, killed: false };
+		};
+		return { exec, spawns: () => spawns };
+	}
+
+	test("unchanged worktree replays the last verdict without a new skeptic run", async () => {
+		const { exec, spawns } = mockExec({ status: "M a.ts", diff: "some diff" });
+		const verify = createSkepticVerifier(exec, goal);
+		const first = await verify("do the thing", 1);
+		const second = await verify("do the thing", 2);
+		assert.equal(spawns(), 1); // second round skipped the subprocess
+		assert.deepEqual(second, first);
+	});
+
+	test("changed worktree triggers a fresh skeptic run", async () => {
+		const state = { status: "M a.ts", diff: "some diff" };
+		const { exec, spawns } = mockExec(state);
+		const verify = createSkepticVerifier(exec, goal);
+		await verify("do the thing", 1);
+		state.diff = "new diff";
+		await verify("do the thing", 2);
+		assert.equal(spawns(), 2);
+	});
+
+	test("git failure never skips verification", async () => {
+		let spawnCount = 0;
+		const exec: ExecFn = async (command) => {
+			if (command === "git") return { stdout: "", stderr: "fatal", code: 128, killed: false };
+			spawnCount += 1;
+			return { stdout: jsonl, stderr: "", code: 0, killed: false };
+		};
+		const verify = createSkepticVerifier(exec, goal);
+		await verify("do the thing", 1);
+		await verify("do the thing", 2);
+		assert.equal(spawnCount, 2);
 	});
 });
