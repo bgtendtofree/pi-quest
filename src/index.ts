@@ -129,6 +129,8 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		if (ctx.isIdle?.() === false || ctx.hasPendingMessages?.() === true) return;
 
 		goal.round += 1;
+		// The skeptic runs 1-2 min; without this the UI looks hung (live-test lesson).
+		ctx.ui?.setStatus?.("pi-quest", `🎯 r${goal.round} verifying…`);
 
 		// Fail-open: a broken verifier never blocks or silently completes the
 		// goal. The round counts as unverified, the loop continues.
@@ -138,6 +140,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		} catch {
 			verdict = undefined;
 		}
+		syncUi(ctx);
 
 		if (verdict?.achieved) {
 			transition("complete", undefined, ctx);
