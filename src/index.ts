@@ -263,11 +263,27 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	});
 
 	// A typed user message redirects the agent: suspend auto-continuation until
-	// /goal resume. Our own continuations arrive with source "extension" and
-	// must not suspend the loop.
+	// /goal resume. MessageEndEvent carries no source field, so our own
+	// kickoff/continuation/wrap-up messages are recognized by their "[goal"
+	// prefix instead. A user genuinely typing "[goal ..." merely skips one
+	// suspend — cheap.
 	pi.on("message_end", async (event, ctx) => {
-		const source = (event as { source?: string }).source;
-		if (event.message?.role === "user" && source !== "extension" && goal?.status === "active" && !goal.suspended) {
+		if (event.message?.role !== "user") return;
+		const content: unknown = event.message.content;
+		const text = !Array.isArray(content)
+			? ""
+			: content
+					.filter(
+						(part): part is { type: "text"; text: string } =>
+							typeof part === "object" &&
+							part !== null &&
+							(part as { type?: unknown }).type === "text" &&
+							typeof (part as { text?: unknown }).text === "string",
+					)
+					.map((part) => part.text)
+					.join("\n");
+		if (text.startsWith("[goal")) return;
+		if (goal?.status === "active" && !goal.suspended) {
 			goal.suspended = true;
 			persist();
 			syncUi(ctx);

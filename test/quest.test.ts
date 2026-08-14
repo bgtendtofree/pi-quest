@@ -51,6 +51,7 @@ interface Fixture {
 	cmd: (args: string) => Promise<void>;
 	settle: () => Promise<void>;
 	userTypes: () => Promise<void>;
+	ownMessage: () => Promise<void>;
 	lastGoal: () => GoalState | undefined;
 }
 
@@ -101,7 +102,11 @@ function fixture(
 			await handler(args, ctx as never);
 		},
 		settle: () => fire("agent_settled", {}),
-		userTypes: () => fire("message_end", { message: { role: "user" }, source: "interactive" }),
+		userTypes: () => fire("message_end", { message: { role: "user", content: [{ type: "text", text: "redirect" }] } }),
+		ownMessage: () =>
+			fire("message_end", {
+				message: { role: "user", content: [{ type: "text", text: "[goal round 1] Objective: x" }] },
+			}),
 		lastGoal: () => {
 			const last = entries.filter((e) => e.customType === "pi-quest").at(-1);
 			return last?.data as GoalState | undefined;
@@ -239,6 +244,15 @@ describe("user control", () => {
 		await f.cmd("resume");
 		await f.settle();
 		assert.equal(f.sent.length, 3);
+	});
+
+	test("our own [goal messages never suspend the loop", async () => {
+		const f = fixture([notDone()]);
+		await f.setGoal("refactor auth");
+		await f.ownMessage();
+		await f.settle();
+		assert.equal(f.lastGoal()?.suspended, false);
+		assert.equal(f.sent.length, 2); // continued normally
 	});
 
 	test("clear drops the goal", async () => {
