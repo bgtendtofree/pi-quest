@@ -13,6 +13,11 @@ describe("parseVerdict", () => {
 		assert.equal(verdict?.modelFixable, true);
 	});
 
+	test("parses a fenced json block without a newline", () => {
+		const verdict = parseVerdict('```json {"achieved": true, "gaps": []}```');
+		assert.equal(verdict?.achieved, true);
+	});
+
 	test("achieved with empty gaps", () => {
 		const verdict = parseVerdict(
 			'```json\n{"achieved": true, "gaps": [], "model_fixable": true, "blocker": null}\n```',
@@ -23,6 +28,11 @@ describe("parseVerdict", () => {
 	test("falls back to a bare trailing object without a fence", () => {
 		const verdict = parseVerdict('analysis...\n{"achieved": false, "gaps": ["no tests"], "model_fixable": true}');
 		assert.equal(verdict?.achieved, false);
+	});
+
+	test("parses a bare verdict starting at first character", () => {
+		const verdict = parseVerdict('{"achieved": true, "gaps": []}');
+		assert.equal(verdict?.achieved, true);
 	});
 
 	test("blocked verdict carries the blocker", () => {

@@ -19,9 +19,10 @@ const DIFF_CAP_CHARS = 50_000;
  */
 export function parseVerdict(text: string): GoalVerdict | undefined {
 	const candidates: string[] = [];
-	const fences = [...text.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)];
+	const fences = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
 	if (fences.length > 0) candidates.push(fences.at(-1)?.[1] ?? "");
-	const tail = text.slice(Math.max(0, text.lastIndexOf("\n{")) + 1);
+	const tailStart = text.lastIndexOf("\n{");
+	const tail = text.slice(tailStart === -1 ? 0 : tailStart + 1);
 	if (tail.includes('"achieved"')) candidates.push(tail.trim());
 
 	for (const candidate of candidates) {

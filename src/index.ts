@@ -44,6 +44,48 @@ export type GoalVerifier = (objective: string, round: number) => Promise<GoalVer
 /** Builds the verifier for one goal (its cwd + baseline are baked in). */
 export type GoalVerifierFactory = (goal: GoalState) => GoalVerifier;
 
+const GOAL_STATUSES = new Set<GoalStatus>([
+	"active",
+	"user_paused",
+	"no_progress_paused",
+	"budget_paused",
+	"blocked",
+	"complete",
+]);
+
+function isGoalStatus(value: unknown): value is GoalStatus {
+	return typeof value === "string" && GOAL_STATUSES.has(value as GoalStatus);
+}
+
+function restoreState(value: unknown): GoalState | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const raw = value as Record<string, unknown>;
+	if (
+		typeof raw.objective !== "string" ||
+		!Number.isInteger(raw.round) ||
+		(raw.round as number) < 0 ||
+		!Number.isInteger(raw.autoTurns) ||
+		(raw.autoTurns as number) < 0 ||
+		!Number.isInteger(raw.maxTurns) ||
+		(raw.maxTurns as number) <= 0 ||
+		typeof raw.suspended !== "boolean" ||
+		typeof raw.cwd !== "string" ||
+		!Number.isInteger(raw.stallCount) ||
+		(raw.stallCount as number) < 0 ||
+		(raw.baselineCommit !== undefined && typeof raw.baselineCommit !== "string") ||
+		(raw.lastGapFingerprint !== undefined && typeof raw.lastGapFingerprint !== "string") ||
+		(raw.lastGaps !== undefined &&
+			(!Array.isArray(raw.lastGaps) || !raw.lastGaps.every((gap) => typeof gap === "string"))) ||
+		(raw.pauseReason !== undefined && typeof raw.pauseReason !== "string")
+	)
+		return undefined;
+	return {
+		...(value as GoalState),
+		status: isGoalStatus(raw.status) ? raw.status : "user_paused",
+		...(isGoalStatus(raw.status) ? {} : { pauseReason: "invalid persisted status" }),
+	};
+}
+
 function isPaused(status: GoalStatus): boolean {
 	return status !== "active" && status !== "complete";
 }
@@ -61,7 +103,7 @@ function gapFingerprint(gaps: string[]): string {
 }
 
 interface Ui {
-	setStatus?: (key: string, text: string) => void;
+	setStatus?: (key: string, text: string | undefined) => void;
 	notify?: (message: string, type?: "error" | "info" | "warning") => void;
 }
 
@@ -88,7 +130,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	}
 
 	function syncUi(ctx: { ui?: Ui }): void {
-		ctx.ui?.setStatus?.("pi-quest", statusText());
+		ctx.ui?.setStatus?.("pi-quest", goal ? statusText() : undefined);
 	}
 
 	function persist(): void {
@@ -120,6 +162,10 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	async function continueGoal(ctx: SettleContext, expectedGoal?: GoalState, expectedVersion?: number): Promise<void> {
 		if (goal?.status !== "active" || goal.suspended) return;
 		if (expectedGoal && (goal !== expectedGoal || goalVersion !== expectedVersion)) return;
+		if (goal.autoTurns >= goal.maxTurns) {
+			transition("budget_paused", `${goal.maxTurns} auto-continuations used up`, ctx);
+			return;
+		}
 		goal.autoTurns += 1;
 		persist();
 		syncUi(ctx);
@@ -298,26 +344,10 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	});
 
 	// A typed user message redirects the agent: suspend auto-continuation until
-	// /goal resume. MessageEndEvent carries no source field, so our own
-	// kickoff/continuation/wrap-up messages are recognized by their "[goal"
-	// prefix instead. A user genuinely typing "[goal ..." merely skips one
-	// suspend — cheap.
-	pi.on("message_end", async (event, ctx) => {
-		if (event.message?.role !== "user") return;
-		const content: unknown = event.message.content;
-		const text = !Array.isArray(content)
-			? ""
-			: content
-					.filter(
-						(part): part is { type: "text"; text: string } =>
-							typeof part === "object" &&
-							part !== null &&
-							(part as { type?: unknown }).type === "text" &&
-							typeof (part as { text?: unknown }).text === "string",
-					)
-					.map((part) => part.text)
-					.join("\n");
-		if (text.startsWith("[goal")) return;
+	// /goal resume. Input events expose source, so extension messages from this
+	// plugin or other extensions do not look like human input.
+	pi.on("input", (event, ctx) => {
+		if (event.source === "extension") return;
 		if (goal?.status === "active" && !goal.suspended) {
 			goalVersion += 1;
 			goal.suspended = true;
@@ -333,8 +363,13 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		goal = undefined;
 		for (const entry of entries) {
 			if (entry.type === "custom" && entry.customType === ENTRY_TYPE && entry.data) {
-				const data = entry.data as GoalState | { status: "cleared" };
-				goal = data.status === "cleared" ? undefined : (data as GoalState);
+				const data = entry.data as { status?: unknown };
+				if (data.status === "cleared") {
+					goal = undefined;
+					continue;
+				}
+				goal = restoreState(entry.data);
+				if (goal && data.status !== goal.status) persist();
 			}
 		}
 		if (goal?.status === "active" && pauseActive) {

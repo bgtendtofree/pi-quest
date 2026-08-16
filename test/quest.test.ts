@@ -79,13 +79,13 @@ function fixture(
 			}),
 	);
 
-	const statuses: string[] = [];
+	const statuses: Array<string | undefined> = [];
 	const ctx = {
 		cwd: "/tmp/quest-test",
 		isIdle: () => true,
 		hasPendingMessages: () => opts?.pending ?? false,
 		ui: {
-			setStatus: (_key: string, text: string) => statuses.push(text),
+			setStatus: (_key: string, text: string | undefined) => statuses.push(text),
 			notify: () => {},
 		},
 		sessionManager: {
@@ -119,11 +119,8 @@ function fixture(
 			await handler(args, ctx as never);
 		},
 		settle: () => fire("agent_settled", {}),
-		userTypes: () => fire("message_end", { message: { role: "user", content: [{ type: "text", text: "redirect" }] } }),
-		ownMessage: () =>
-			fire("message_end", {
-				message: { role: "user", content: [{ type: "text", text: "[goal round 1] Objective: x" }] },
-			}),
+		userTypes: () => fire("input", { source: "interactive", text: "redirect" }),
+		ownMessage: () => fire("input", { source: "extension", text: "[goal round 1] Objective: x" }),
 		lastGoal: () => {
 			const last = entries.filter((e) => e.customType === "pi-quest").at(-1);
 			return last?.data as GoalState | undefined;
@@ -277,6 +274,7 @@ describe("user control", () => {
 		await f.setGoal("refactor auth");
 		await f.cmd("clear");
 		assert.equal(f.lastGoal()?.status, "cleared");
+		assert.equal(f.statuses.at(-1), undefined);
 		await f.settle();
 		assert.equal(f.sent.length, 1);
 	});
@@ -299,6 +297,23 @@ describe("persistence discipline", () => {
 		assert.equal(f.lastGoal()?.status, "user_paused");
 		await f.settle();
 		assert.equal(f.sent.length, 0); // paused goal never continues
+	});
+
+	test("invalid persisted status is paused instead of self-driving", async () => {
+		const stored = {
+			objective: "refactor auth",
+			status: "future_status",
+			round: 3,
+			autoTurns: 2,
+			maxTurns: 20,
+			suspended: false,
+			cwd: "/tmp/quest-test",
+			stallCount: 0,
+		};
+		const f = fixture([], { entries: [{ customType: "pi-quest", data: stored }], startReason: "resume" });
+		await f.setGoal("status");
+		assert.equal(f.lastGoal()?.status, "user_paused");
+		assert.equal(f.sent.length, 0);
 	});
 
 	test("restores state from current branch, not another branch", async () => {
