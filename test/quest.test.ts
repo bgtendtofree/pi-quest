@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createQuest, type GoalState, type GoalVerdict } from "../src/index.ts";
+import { createQuest, type GoalState, type GoalVerdict, type GoalVerifier } from "../src/index.ts";
 
 interface Sent {
 	content: string;
@@ -57,16 +57,27 @@ interface Fixture {
 
 function fixture(
 	verdicts: Array<GoalVerdict | Error>,
-	opts?: { entries?: Array<{ customType: string; data: unknown }>; startReason?: string; pending?: boolean },
+	opts?: {
+		entries?: Array<{ customType: string; data: unknown }>;
+		branchEntries?: Array<{ customType: string; data: unknown }>;
+		startReason?: string;
+		pending?: boolean;
+		verifier?: GoalVerifier;
+	},
 ): Fixture {
 	const { pi, handlers, commands, sent, entries } = createPi();
 	let call = 0;
-	createQuest(pi, () => async () => {
-		const next = verdicts[Math.min(call, verdicts.length - 1)];
-		call += 1;
-		if (next instanceof Error) throw next;
-		return next ?? { achieved: false, gaps: [], modelFixable: true };
-	});
+	createQuest(
+		pi,
+		() =>
+			opts?.verifier ??
+			(async () => {
+				const next = verdicts[Math.min(call, verdicts.length - 1)];
+				call += 1;
+				if (next instanceof Error) throw next;
+				return next ?? { achieved: false, gaps: [], modelFixable: true };
+			}),
+	);
 
 	const statuses: string[] = [];
 	const ctx = {
@@ -79,6 +90,12 @@ function fixture(
 		},
 		sessionManager: {
 			getEntries: () => (opts?.entries ?? []).map((e) => ({ type: "custom", customType: e.customType, data: e.data })),
+			getBranch: () =>
+				(opts?.branchEntries ?? opts?.entries ?? []).map((e) => ({
+					type: "custom",
+					customType: e.customType,
+					data: e.data,
+				})),
 		},
 	};
 
@@ -279,9 +296,74 @@ describe("persistence discipline", () => {
 		};
 		const f = fixture([], { entries: [{ customType: "pi-quest", data: stored }], startReason: "resume" });
 		await f.setGoal("status"); // session_start fires inside setGoal
-		assert.equal(f.lastGoal(), undefined); // nothing persisted yet
+		assert.equal(f.lastGoal()?.status, "user_paused");
 		await f.settle();
 		assert.equal(f.sent.length, 0); // paused goal never continues
+	});
+
+	test("restores state from current branch, not another branch", async () => {
+		const otherBranch: GoalState = {
+			objective: "wrong branch",
+			status: "active",
+			round: 9,
+			autoTurns: 9,
+			maxTurns: 20,
+			suspended: false,
+			cwd: "/tmp/quest-test",
+			stallCount: 0,
+		};
+		const currentBranch: GoalState = {
+			objective: "current branch",
+			status: "user_paused",
+			round: 2,
+			autoTurns: 1,
+			maxTurns: 20,
+			suspended: false,
+			cwd: "/tmp/quest-test",
+			stallCount: 0,
+		};
+		const f = fixture([], {
+			entries: [{ customType: "pi-quest", data: otherBranch }],
+			branchEntries: [{ customType: "pi-quest", data: currentBranch }],
+		});
+		await f.setGoal("status");
+		assert.match(f.statuses.at(-1) ?? "", /user paused/);
+		assert.match(f.sent.join("\n"), /^$/);
+	});
+
+	test("verdict finishing after pause cannot continue goal", async () => {
+		let resolveVerdict!: (verdict: GoalVerdict) => void;
+		let verifierStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			verifierStarted = resolve;
+		});
+		const verdict = new Promise<GoalVerdict>((resolve) => {
+			resolveVerdict = resolve;
+		});
+		const f = fixture([], {
+			verifier: async () => {
+				verifierStarted();
+				return verdict;
+			},
+		});
+		await f.setGoal("refactor auth");
+		const settling = f.settle();
+		await started;
+		await f.cmd("pause");
+		resolveVerdict({ achieved: false, gaps: ["still broken"], modelFixable: true });
+		await settling;
+		assert.equal(f.lastGoal()?.status, "user_paused");
+		assert.equal(f.sent.length, 1);
+	});
+
+	test("budget-paused goal cannot resume past cap", async () => {
+		const f = fixture([notDone()]);
+		await f.setGoal("refactor auth --max-turns 1");
+		await f.settle();
+		await f.settle();
+		assert.equal(f.lastGoal()?.status, "budget_paused");
+		await f.cmd("resume");
+		assert.equal(f.lastGoal()?.status, "budget_paused");
 	});
 
 	test("/reload keeps an active goal active", async () => {

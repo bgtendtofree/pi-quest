@@ -22,7 +22,7 @@ Statuses: `active · user_paused · no_progress_paused · budget_paused · block
 | Exit | Trigger |
 |---|---|
 | `complete` | verifier reports achieved |
-| `no_progress_paused` | identical verifier-gap fingerprint twice in a row (Grok Build's stall exit) |
+| `no_progress_paused` | identical verifier-gap fingerprint twice in a row |
 | `budget_paused` | max continuations used; agent gets a wrap-up turn to summarize |
 | `blocked` | verifier reports only non-model-fixable gaps |
 | `user_paused` | `/goal pause`, or restored from a previous session |

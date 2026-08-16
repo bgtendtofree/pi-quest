@@ -4,8 +4,7 @@ import { captureBaseline, createSkepticVerifier } from "./verifier.ts";
 
 const DEFAULT_MAX_TURNS = 20;
 // Identical gap fingerprints in a row before the goal auto-pauses.
-// Grok Build's GOAL_CLASSIFIER_STALL_THRESHOLD: two means nothing changed
-// between attempts, iterating further is futile.
+// Two means nothing changed between attempts; iterating further is futile.
 const STALL_THRESHOLD = 2;
 const ENTRY_TYPE = "pi-quest";
 
@@ -75,6 +74,8 @@ interface SettleContext {
 export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory): void {
 	let goal: GoalState | undefined;
 	let verify: GoalVerifier | undefined;
+	let goalVersion = 0;
+	let settleInFlight = false;
 
 	function statusText(): string {
 		if (!goal) return "";
@@ -116,8 +117,9 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		);
 	}
 
-	async function continueGoal(ctx: SettleContext): Promise<void> {
-		if (!goal) return;
+	async function continueGoal(ctx: SettleContext, expectedGoal?: GoalState, expectedVersion?: number): Promise<void> {
+		if (goal?.status !== "active" || goal.suspended) return;
+		if (expectedGoal && (goal !== expectedGoal || goalVersion !== expectedVersion)) return;
 		goal.autoTurns += 1;
 		persist();
 		syncUi(ctx);
@@ -125,61 +127,81 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	}
 
 	async function onSettled(ctx: SettleContext): Promise<void> {
-		if (!goal || goal.status !== "active" || goal.suspended) return;
+		if (goal?.status !== "active" || goal.suspended) return;
 		if (ctx.isIdle?.() === false || ctx.hasPendingMessages?.() === true) return;
+		if (settleInFlight) return;
 
-		goal.round += 1;
-		// The skeptic runs 1-2 min; without this the UI looks hung (live-test lesson).
-		ctx.ui?.setStatus?.("pi-quest", `🎯 r${goal.round} verifying…`);
-
-		// Fail-open: a broken verifier never blocks or silently completes the
-		// goal. The round counts as unverified, the loop continues.
-		let verdict: GoalVerdict | undefined;
+		const settledGoal = goal;
+		const settledVerify = verify;
+		const settledVersion = goalVersion;
+		settleInFlight = true;
 		try {
-			verdict = verify ? await verify(goal.objective, goal.round) : undefined;
-		} catch {
-			verdict = undefined;
-		}
-		syncUi(ctx);
+			settledGoal.round += 1;
+			// The skeptic runs 1-2 min; without this the UI looks hung (live-test lesson).
+			ctx.ui?.setStatus?.("pi-quest", `🎯 r${settledGoal.round} verifying…`);
 
-		if (verdict?.achieved) {
-			transition("complete", undefined, ctx);
-			return;
-		}
-		if (verdict && !verdict.modelFixable) {
-			transition("blocked", verdict.blocker ?? "verifier reports non-model-fixable gaps", ctx);
-			return;
-		}
-		if (verdict && verdict.gaps.length > 0) {
-			goal.lastGaps = verdict.gaps;
-			const fingerprint = gapFingerprint(verdict.gaps);
-			if (fingerprint === goal.lastGapFingerprint) {
-				goal.stallCount += 1;
-			} else {
-				goal.lastGapFingerprint = fingerprint;
-				goal.stallCount = 1;
+			// Fail-open: a broken verifier never blocks or silently completes the
+			// goal. The round counts as unverified, the loop continues.
+			let verdict: GoalVerdict | undefined;
+			try {
+				verdict = settledVerify ? await settledVerify(settledGoal.objective, settledGoal.round) : undefined;
+			} catch {
+				verdict = undefined;
 			}
-			if (goal.stallCount >= STALL_THRESHOLD) {
-				transition("no_progress_paused", "same verifier gaps twice in a row", ctx);
+
+			// User control may have changed or replaced goal while skeptic ran.
+			// Never apply old verdict to current goal.
+			if (
+				goal !== settledGoal ||
+				goalVersion !== settledVersion ||
+				settledGoal.status !== "active" ||
+				settledGoal.suspended
+			)
+				return;
+			syncUi(ctx);
+
+			if (verdict?.achieved) {
+				transition("complete", undefined, ctx);
 				return;
 			}
-		} else if (verdict) {
-			// A clean round clears stale gaps so the next continuation
-			// never replays already-fixed feedback.
-			delete goal.lastGaps;
-		}
+			if (verdict && !verdict.modelFixable) {
+				transition("blocked", verdict.blocker ?? "verifier reports non-model-fixable gaps", ctx);
+				return;
+			}
+			if (verdict && verdict.gaps.length > 0) {
+				goal.lastGaps = verdict.gaps;
+				const fingerprint = gapFingerprint(verdict.gaps);
+				if (fingerprint === goal.lastGapFingerprint) {
+					goal.stallCount += 1;
+				} else {
+					goal.lastGapFingerprint = fingerprint;
+					goal.stallCount = 1;
+				}
+				if (goal.stallCount >= STALL_THRESHOLD) {
+					transition("no_progress_paused", "same verifier gaps twice in a row", ctx);
+					return;
+				}
+			} else {
+				// A clean or unverified round breaks consecutive-gap detection.
+				if (verdict) delete goal.lastGaps;
+				delete goal.lastGapFingerprint;
+				goal.stallCount = 0;
+			}
 
-		if (goal.autoTurns >= goal.maxTurns) {
-			transition("budget_paused", `${goal.maxTurns} auto-continuations used up`, ctx);
-			await pi.sendUserMessage(
-				`[goal] Auto-paused after ${goal.maxTurns} continuations. ` +
-					"Summarize what is done, what remains, and what you would need to finish.",
-				{ deliverAs: "followUp" },
-			);
-			return;
-		}
+			if (goal.autoTurns >= goal.maxTurns) {
+				transition("budget_paused", `${goal.maxTurns} auto-continuations used up`, ctx);
+				await pi.sendUserMessage(
+					`[goal] Auto-paused after ${goal.maxTurns} continuations. ` +
+						"Summarize what is done, what remains, and what you would need to finish.",
+					{ deliverAs: "followUp" },
+				);
+				return;
+			}
 
-		await continueGoal(ctx);
+			await continueGoal(ctx, settledGoal, settledVersion);
+		} finally {
+			settleInFlight = false;
+		}
 	}
 
 	function parseSetArgs(args: string): { objective: string; maxTurns: number } | undefined {
@@ -205,11 +227,19 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 				return;
 			}
 			if (sub === "pause") {
-				if (goal?.status === "active") transition("user_paused", "paused by user", ctx);
+				if (goal?.status === "active") {
+					goalVersion += 1;
+					transition("user_paused", "paused by user", ctx);
+				}
 				return;
 			}
 			if (sub === "resume") {
+				if (goal?.status === "budget_paused") {
+					ctx.ui.notify("🎯 budget exhausted; set a new goal", "warning");
+					return;
+				}
 				if (goal && (isPaused(goal.status) || goal.suspended)) {
+					goalVersion += 1;
 					goal.suspended = false;
 					transition("active", undefined, ctx);
 					await continueGoal(ctx);
@@ -219,6 +249,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 			if (sub === "clear") {
 				// Tombstone: without it the last persisted snapshot would
 				// resurrect the goal on the next session restore.
+				goalVersion += 1;
 				pi.appendEntry(ENTRY_TYPE, { status: "cleared" });
 				goal = undefined;
 				syncUi(ctx);
@@ -239,6 +270,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 				ctx.ui.notify("usage: /goal <objective> [--max-turns N]", "error");
 				return;
 			}
+			goalVersion += 1;
 			const baselineCommit = await captureBaseline((c, a, o) => pi.exec(c, a, o), ctx.cwd);
 			goal = {
 				objective: parsed.objective,
@@ -287,32 +319,46 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 					.join("\n");
 		if (text.startsWith("[goal")) return;
 		if (goal?.status === "active" && !goal.suspended) {
+			goalVersion += 1;
 			goal.suspended = true;
 			persist();
 			syncUi(ctx);
 		}
 	});
 
-	pi.on("session_start", async (event, ctx) => {
+	function restoreGoal(
+		entries: ReadonlyArray<{ type: string; customType?: string; data?: unknown }>,
+		pauseActive: boolean,
+	): void {
 		goal = undefined;
-		for (const entry of ctx.sessionManager.getEntries()) {
+		for (const entry of entries) {
 			if (entry.type === "custom" && entry.customType === ENTRY_TYPE && entry.data) {
 				const data = entry.data as GoalState | { status: "cleared" };
 				goal = data.status === "cleared" ? undefined : (data as GoalState);
 			}
 		}
-		// Grok discipline: a restored goal never silently re-arms as a
-		// self-driving loop. /reload keeps continuity; every other start
-		// reason forces user_paused.
-		if (goal?.status === "active" && event.reason !== "reload") {
+		if (goal?.status === "active" && pauseActive) {
 			goal.status = "user_paused";
 			goal.pauseReason = "restored from a previous session";
+			persist();
 		}
 		verify = goal ? makeVerifier(goal) : undefined;
+	}
+
+	pi.on("session_start", async (event, ctx) => {
+		goalVersion += 1;
+		restoreGoal(ctx.sessionManager.getBranch(), event.reason !== "reload");
+		syncUi(ctx);
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		goalVersion += 1;
+		restoreGoal(ctx.sessionManager.getBranch(), false);
 		syncUi(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
+		goalVersion += 1;
 		goal = undefined;
 		verify = undefined;
 	});

@@ -59,7 +59,7 @@ describe("buildSkepticPrompt", () => {
 	});
 });
 
-describe("skeptic worktree caching", () => {
+describe("skeptic worktree verification", () => {
 	const goal: GoalState = {
 		objective: "do the thing",
 		status: "active",
@@ -91,13 +91,12 @@ describe("skeptic worktree caching", () => {
 		return { exec, spawns: () => spawns };
 	}
 
-	test("unchanged worktree replays the last verdict without a new skeptic run", async () => {
+	test("unchanged worktree still triggers a fresh skeptic run", async () => {
 		const { exec, spawns } = mockExec({ status: "M a.ts", diff: "some diff" });
 		const verify = createSkepticVerifier(exec, goal);
-		const first = await verify("do the thing", 1);
-		const second = await verify("do the thing", 2);
-		assert.equal(spawns(), 1); // second round skipped the subprocess
-		assert.deepEqual(second, first);
+		await verify("do the thing", 1);
+		await verify("do the thing", 2);
+		assert.equal(spawns(), 2);
 	});
 
 	test("changed worktree triggers a fresh skeptic run", async () => {
