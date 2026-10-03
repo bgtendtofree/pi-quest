@@ -1,7 +1,19 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createQuest, type GoalState, type GoalVerdict, type GoalVerifier } from "../src/index.ts";
+import type {
+	AgentBeforeSettleEvent,
+	BoundaryResult,
+	ExtensionAPI,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import quest, {
+	createQuest,
+	type GoalState,
+	type GoalVerdict,
+	type GoalVerifier,
+	type GoalView,
+} from "../src/index.ts";
+import { VerificationError } from "../src/verifier.ts";
 
 interface Sent {
 	content: string;
@@ -14,11 +26,13 @@ function createPi(): {
 	commands: Map<string, (args: string, ctx: never) => Promise<void>>;
 	sent: Sent[];
 	entries: Array<{ customType: string; data: unknown }>;
+	tools: Map<string, ToolDefinition>;
 } {
 	const handlers = new Map();
 	const commands = new Map();
 	const sent: Sent[] = [];
 	const entries: Array<{ customType: string; data: unknown }> = [];
+	const tools = new Map<string, ToolDefinition>();
 	const pi = {
 		on(event: string, handler: (event: never, ctx: never) => unknown) {
 			const list = handlers.get(event) ?? [];
@@ -27,6 +41,9 @@ function createPi(): {
 		},
 		registerCommand(name: string, def: { handler: (args: string, ctx: never) => Promise<void> }) {
 			commands.set(name, def.handler);
+		},
+		registerTool(tool: ToolDefinition) {
+			tools.set(tool.name, tool);
 		},
 		sendUserMessage(content: string, options?: Sent["options"]) {
 			sent.push({ content, options });
@@ -40,16 +57,19 @@ function createPi(): {
 			return Promise.resolve({ stdout: "", stderr: "not a repo", code: 128, killed: false });
 		},
 	} as unknown as ExtensionAPI;
-	return { pi, handlers, commands, sent, entries };
+	return { pi, handlers, commands, sent, entries, tools };
 }
 
 interface Fixture {
 	sent: Sent[];
 	entries: Array<{ customType: string; data: unknown }>;
 	statuses: string[];
+	notifications: string[];
+	query: () => Promise<GoalView>;
 	setGoal: (args: string) => Promise<void>;
 	cmd: (args: string) => Promise<void>;
-	settle: () => Promise<void>;
+	settle: (event?: Partial<AgentBeforeSettleEvent>) => Promise<BoundaryResult | undefined>;
+	fire: (event: string, payload?: unknown) => Promise<unknown>;
 	userTypes: () => Promise<void>;
 	ownMessage: () => Promise<void>;
 	lastGoal: () => GoalState | undefined;
@@ -62,10 +82,13 @@ function fixture(
 		branchEntries?: Array<{ customType: string; data: unknown }>;
 		startReason?: string;
 		pending?: boolean;
+		signal?: AbortSignal;
 		verifier?: GoalVerifier;
+		exec?: ExtensionAPI["exec"];
 	},
 ): Fixture {
-	const { pi, handlers, commands, sent, entries } = createPi();
+	const { pi, handlers, commands, sent, entries, tools } = createPi();
+	if (opts?.exec) pi.exec = opts.exec;
 	let call = 0;
 	createQuest(
 		pi,
@@ -80,13 +103,15 @@ function fixture(
 	);
 
 	const statuses: Array<string | undefined> = [];
+	const notifications: string[] = [];
 	const ctx = {
 		cwd: "/tmp/quest-test",
 		isIdle: () => true,
 		hasPendingMessages: () => opts?.pending ?? false,
+		signal: opts?.signal,
 		ui: {
 			setStatus: (_key: string, text: string | undefined) => statuses.push(text),
-			notify: () => {},
+			notify: (text: string) => notifications.push(text),
 		},
 		sessionManager: {
 			getEntries: () => (opts?.entries ?? []).map((e) => ({ type: "custom", customType: e.customType, data: e.data })),
@@ -99,14 +124,25 @@ function fixture(
 		},
 	};
 
-	const fire = async (event: string, payload: unknown) => {
-		for (const handler of handlers.get(event) ?? []) await handler(payload as never, ctx as never);
+	const fire = async (event: string, payload: unknown = {}) => {
+		let result: unknown;
+		for (const handler of handlers.get(event) ?? []) result = await handler(payload as never, ctx as never);
+		return result;
 	};
 
 	return {
 		sent,
 		entries,
 		statuses,
+		notifications,
+		query: async () => {
+			const tool = tools.get("quest_get_goal");
+			assert.ok(tool);
+			const result = await tool.execute("query", {}, undefined, undefined as never, ctx as never);
+			assert.deepEqual(JSON.parse((result.content[0] as { text: string }).text), result.structuredContent);
+			assert.deepEqual(result.details, result.structuredContent);
+			return result.structuredContent as GoalView;
+		},
 		setGoal: async (args) => {
 			await fire("session_start", { reason: opts?.startReason ?? "startup" });
 			const handler = commands.get("goal");
@@ -118,9 +154,26 @@ function fixture(
 			assert.ok(handler);
 			await handler(args, ctx as never);
 		},
-		settle: () => fire("agent_settled", {}),
-		userTypes: () => fire("input", { source: "interactive", text: "redirect" }),
-		ownMessage: () => fire("input", { source: "extension", text: "[goal round 1] Objective: x" }),
+		settle: async (event = {}) => {
+			const result = (await fire("agent_before_settle", {
+				entries: [],
+				continue: false,
+				context: { pendingMessages: [] },
+				outcome: "completed",
+				...event,
+			})) as BoundaryResult | undefined;
+			for (const entry of result?.entries ?? []) {
+				if (entry.type === "custom_message" && typeof entry.content === "string") sent.push({ content: entry.content });
+			}
+			return result;
+		},
+		fire,
+		userTypes: async () => {
+			await fire("input", { source: "interactive", text: "redirect" });
+		},
+		ownMessage: async () => {
+			await fire("input", { source: "extension", text: "[goal round 1] Objective: x" });
+		},
 		lastGoal: () => {
 			const last = entries.filter((e) => e.customType === "pi-quest").at(-1);
 			return last?.data as GoalState | undefined;
@@ -129,6 +182,222 @@ function fixture(
 }
 
 const notDone = (gaps: string[] = []): GoalVerdict => ({ achieved: false, gaps, modelFixable: true });
+
+describe("goal query and verification summaries", () => {
+	test("query is read-only, detached, and explicitly reports no goal", async () => {
+		const f = fixture([notDone(["tests fail"])]);
+		assert.deepEqual(await f.query(), { goal: null });
+		assert.equal(f.entries.length, 0);
+		assert.equal(f.sent.length, 0);
+		await f.setGoal("refactor auth");
+		await f.settle();
+		const before = structuredClone(f.entries);
+		const sent = f.sent.length;
+		const snapshot = (await f.query()).goal;
+		assert.ok(snapshot);
+		assert.equal(snapshot.status, "active");
+		assert.equal(snapshot.round, 1);
+		assert.equal(snapshot.remainingTurns, 19);
+		assert.equal(snapshot.lastVerification?.outcome, "verified-incomplete");
+		snapshot.objective = "tampered";
+		snapshot.lastGaps.push("tampered");
+		snapshot.lastVerification?.gaps.push("tampered");
+		assert.deepEqual(f.entries, before);
+		assert.equal(f.sent.length, sent);
+		assert.equal((await f.query()).goal?.objective, "refactor auth");
+		assert.deepEqual((await f.query()).goal?.lastVerification?.gaps, ["tests fail"]);
+		await f.cmd("clear");
+		assert.deepEqual(await f.query(), { goal: null });
+	});
+
+	test("query reflects suspension and every terminal state without resuming", async () => {
+		const suspended = fixture([]);
+		await suspended.setGoal("document API");
+		await suspended.userTypes();
+		assert.equal((await suspended.query()).goal?.suspended, true);
+		for (const status of ["user_paused", "no_progress_paused", "budget_paused", "blocked", "complete"] as const) {
+			const f = fixture([
+				status === "complete"
+					? { achieved: true, gaps: [], modelFixable: true }
+					: {
+							achieved: false,
+							gaps: status === "budget_paused" ? [] : ["missing section"],
+							modelFixable: status !== "blocked",
+							blocker: "decision",
+						},
+			]);
+			await f.setGoal("document API --max-turns 1");
+			if (status === "user_paused") await f.cmd("pause");
+			else {
+				await f.settle();
+				if (status === "no_progress_paused" || status === "budget_paused") await f.settle();
+			}
+			const count = f.sent.length;
+			assert.equal((await f.query()).goal?.status, status);
+			assert.equal(f.sent.length, count);
+			if (status === "budget_paused") assert.equal((await f.query()).goal?.remainingTurns, 0);
+		}
+	});
+
+	test("large query text and summary gaps are bounded without changing the objective", async () => {
+		const gaps = Array.from({ length: 30 }, () => "x".repeat(2000));
+		const f = fixture([notDone(gaps)]);
+		const objective = "x".repeat(20_000);
+		await f.setGoal(objective);
+		await f.settle();
+		const snapshot = (await f.query()).goal;
+		assert.equal(snapshot?.objective.length, 4096);
+		assert.equal(snapshot?.lastGaps.length, 10);
+		assert.equal(snapshot?.lastGaps[0]?.length, 512);
+		assert.equal(snapshot?.truncated, true);
+		assert.equal(snapshot?.lastVerification?.truncated, true);
+		assert.ok(JSON.stringify(snapshot).length < 16_000);
+		assert.equal(f.lastGoal()?.objective, objective);
+		assert.deepEqual(f.lastGoal()?.lastGaps, gaps);
+	});
+
+	test("success and blocked records carry model and current gaps; completion clears stale gaps", async () => {
+		const f = fixture([
+			notDone(["missing docs"]),
+			{ achieved: true, gaps: [], modelFixable: true, model: "test/physical" },
+		]);
+		await f.setGoal("code and docs");
+		await f.settle();
+		await f.settle();
+		const latest = (await f.query()).goal?.lastVerification;
+		assert.equal(latest?.outcome, "verified-achieved");
+		assert.equal(latest?.round, 2);
+		assert.equal(latest?.model, "test/physical");
+		assert.ok(Number.isSafeInteger(latest?.durationMs));
+		assert.deepEqual((await f.query()).goal?.lastGaps, []);
+		const blocked = fixture([{ achieved: false, gaps: ["human decision"], modelFixable: false }]);
+		await blocked.setGoal("finish report");
+		await blocked.settle();
+		assert.deepEqual((await blocked.query()).goal?.lastGaps, ["human decision"]);
+	});
+
+	test("all failure kinds stay unverified and visible without copying secrets", async () => {
+		for (const kind of ["timeout", "process", "model", "output"] as const) {
+			const error = new VerificationError(kind, "test/physical");
+			error.message = "Bearer secret-token OPENAI_API_KEY=secret-key";
+			const f = fixture([error]);
+			await f.setGoal("refactor auth");
+			await f.settle();
+			assert.equal(f.lastGoal()?.status, "active");
+			assert.equal(f.lastGoal()?.lastVerification?.outcome, "unverified");
+			assert.equal(f.lastGoal()?.lastVerification?.failure?.kind, kind);
+			assert.equal(f.lastGoal()?.lastVerification?.model, "test/physical");
+			await f.cmd("status");
+			assert.match(f.notifications.at(-1) ?? "", new RegExp(`unverified.*${kind}`));
+			assert.doesNotMatch(JSON.stringify([f.entries, await f.query(), f.notifications]), /secret-token|secret-key/);
+		}
+		const f = fixture([new Error("raw credentials")]);
+		await f.setGoal("refactor auth");
+		await f.settle();
+		assert.equal(f.lastGoal()?.lastVerification?.failure?.kind, "process");
+		assert.doesNotMatch(JSON.stringify(f.entries), /raw credentials/);
+	});
+
+	test("old sessions survive; latest summary restores independently of external references", async () => {
+		const f = fixture([new VerificationError("output")]);
+		await f.setGoal("document API");
+		await f.settle();
+		const stored = structuredClone(f.lastGoal());
+		const restored = fixture([], { entries: [{ customType: "pi-quest", data: stored }] });
+		await restored.setGoal("status");
+		assert.equal((await restored.query()).goal?.lastVerification?.failure?.kind, "output");
+		assert.equal((await restored.query()).goal?.status, "user_paused");
+		for (const lastVerification of [undefined, { outcome: "bad" }, { ...stored?.lastVerification, round: -1 }]) {
+			const legacy = fixture([], { entries: [{ customType: "pi-quest", data: { ...stored, lastVerification } }] });
+			await legacy.setGoal("status");
+			assert.equal((await legacy.query()).goal?.objective, "document API");
+			assert.equal((await legacy.query()).goal?.lastVerification, undefined);
+			assert.equal(legacy.sent.length, 0);
+		}
+	});
+
+	test("restored verification is bounded, sanitizes failures, and follows only the selected branch", async () => {
+		const f = fixture([notDone()]);
+		await f.setGoal("current branch");
+		await f.settle();
+		const current = structuredClone(f.lastGoal());
+		assert.ok(current);
+		current.lastVerification = {
+			outcome: "unverified",
+			round: 1,
+			durationMs: 5,
+			model: "x".repeat(300),
+			gaps: ["g".repeat(2000)],
+			truncated: false,
+			failure: { kind: "model", reason: "secret-stored-error" },
+		};
+		const restored = fixture([], {
+			entries: [{ customType: "pi-quest", data: { ...current, objective: "other branch" } }],
+			branchEntries: [{ customType: "pi-quest", data: current }],
+		});
+		await restored.setGoal("status");
+		const snapshot = (await restored.query()).goal;
+		assert.equal(snapshot?.objective, "current branch");
+		assert.equal(snapshot?.lastVerification?.model?.length, 200);
+		assert.equal(snapshot?.lastVerification?.gaps[0]?.length, 512);
+		assert.equal(snapshot?.lastVerification?.truncated, true);
+		assert.doesNotMatch(JSON.stringify([snapshot, restored.entries, restored.notifications]), /secret-stored-error/);
+	});
+});
+
+test("default verifier follows the latest physical model, not the virtual selection", async () => {
+	const { pi, handlers, commands } = createPi();
+	let spawned = false;
+	pi.exec = async (command, args) => {
+		if (command === "git") return { stdout: "abc123", stderr: "", code: 0, killed: false };
+		spawned = true;
+		assert.equal(args[args.indexOf("--model") + 1], "openai/gpt-6.1-sol");
+		assert.equal(args[args.indexOf("--thinking") + 1], "high");
+		return {
+			stdout: JSON.stringify({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: '{"achieved": true, "gaps": []}' }],
+					stopReason: "stop",
+				},
+			}),
+			stderr: "",
+			code: 0,
+			killed: false,
+		};
+	};
+	quest(pi);
+	const ctx = {
+		cwd: "/tmp/quest-test",
+		model: { api: "pi-virtual", provider: "router", id: "auto" },
+		thinkingLevel: "low",
+		ui: { setStatus: () => {}, notify: () => {} },
+		hasPendingMessages: () => false,
+		sessionManager: {
+			getBranch: () => [
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						provider: "openai",
+						model: "gpt-6.1-sol",
+						thinkingLevel: "high",
+						stopReason: "stop",
+					},
+				},
+			],
+		},
+	};
+	await commands.get("goal")?.("refactor auth", ctx as never);
+	for (const handler of handlers.get("agent_before_settle") ?? []) {
+		await handler(
+			{ entries: [], continue: false, context: { pendingMessages: [] }, outcome: "completed" } as never,
+			ctx as never,
+		);
+	}
+	assert.equal(spawned, true);
+});
 
 describe("loop", () => {
 	test("setting a goal kicks off work immediately", async () => {
@@ -139,13 +408,14 @@ describe("loop", () => {
 		assert.equal(f.lastGoal()?.status, "active");
 	});
 
-	test("agent_settled continues an active goal with a followUp turn", async () => {
+	test("agent_before_settle requests a native continuation", async () => {
 		const f = fixture([notDone()]);
 		await f.setGoal("refactor auth");
-		await f.settle();
+		const result = await f.settle();
 		assert.equal(f.sent.length, 2);
 		assert.match(f.sent[1]?.content ?? "", /Continue working/);
-		assert.equal(f.sent[1]?.options?.deliverAs, "followUp");
+		assert.equal(result?.continue, true);
+		assert.equal(result?.entries?.[0]?.type, "custom_message");
 	});
 
 	test("achieved verdict completes the goal and stops the loop", async () => {
@@ -172,6 +442,35 @@ describe("loop", () => {
 		await f.settle();
 		assert.equal(f.lastGoal()?.status, "active");
 		assert.equal(f.sent.length, 2);
+	});
+
+	test("agent_settled is notification-only; existing boundary drafts survive", async () => {
+		const f = fixture([notDone()]);
+		await f.setGoal("refactor auth");
+		await f.fire("agent_settled");
+		assert.equal(f.sent.length, 1);
+		const draft = { type: "custom" as const, customType: "other-plugin", data: 1 };
+		const result = await f.settle({ entries: [draft] });
+		assert.deepEqual(result?.entries?.[0], draft);
+		assert.equal(result?.continue, true);
+	});
+
+	test("another extension's continuation does not spend goal budget", async () => {
+		const f = fixture([notDone()]);
+		await f.setGoal("refactor auth");
+		assert.equal(await f.settle({ continue: true }), undefined);
+		assert.equal(f.lastGoal()?.round, 0);
+		assert.equal(f.lastGoal()?.autoTurns, 0);
+	});
+
+	test("failed or aborted runs pause without verifying or continuing", async () => {
+		for (const outcome of ["error", "aborted"] as const) {
+			const f = fixture([{ achieved: true, gaps: [], modelFixable: true }]);
+			await f.setGoal("refactor auth");
+			await f.settle({ outcome });
+			assert.equal(f.lastGoal()?.status, "user_paused");
+			assert.equal(f.sent.length, 1);
+		}
 	});
 });
 
@@ -200,6 +499,18 @@ describe("stall detection", () => {
 		await f.settle();
 		await f.settle();
 		assert.equal(f.lastGoal()?.status, "no_progress_paused");
+	});
+
+	test("duplicate gaps do not hide a stall; resume starts a fresh streak", async () => {
+		const f = fixture([notDone(["tests fail", "tests fail"]), notDone(["tests fail"])]);
+		await f.setGoal("refactor auth");
+		await f.settle();
+		await f.settle();
+		assert.equal(f.lastGoal()?.status, "no_progress_paused");
+		await f.cmd("resume");
+		await f.settle();
+		assert.equal(f.lastGoal()?.status, "active");
+		assert.equal(f.lastGoal()?.stallCount, 1);
 	});
 });
 
@@ -277,6 +588,123 @@ describe("user control", () => {
 		assert.equal(f.statuses.at(-1), undefined);
 		await f.settle();
 		assert.equal(f.sent.length, 1);
+	});
+
+	test("Esc abort observed at settlement pauses without rearming", async () => {
+		const f = fixture([]);
+		await f.setGoal("refactor auth");
+		await f.fire("agent_start");
+		await f.fire("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] });
+		await f.fire("agent_settled");
+		assert.equal(f.lastGoal()?.status, "user_paused");
+		assert.equal(f.sent.length, 1);
+	});
+
+	test("pause, clear, input, tree navigation, and shutdown cancel verification", async () => {
+		for (const action of ["pause", "clear", "input", "session_tree", "session_shutdown"]) {
+			let started!: () => void;
+			const ready = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			let signal: AbortSignal | undefined;
+			const f = fixture([], {
+				verifier: async (_objective, _round, activeSignal) => {
+					signal = activeSignal;
+					started();
+					await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+					return { achieved: true, gaps: [], modelFixable: true };
+				},
+			});
+			await f.setGoal("refactor auth");
+			const settling = f.settle();
+			await ready;
+			if (action === "pause" || action === "clear") await f.cmd(action);
+			else if (action === "input") await f.userTypes();
+			else await f.fire(action);
+			assert.equal(signal?.aborted, true);
+			assert.equal(await settling, undefined);
+			assert.equal(f.sent.length, 1);
+			assert.notEqual(f.lastGoal()?.status, "complete");
+			assert.equal((await f.query()).goal?.lastVerification, undefined);
+		}
+	});
+
+	test("turn cancellation is not treated as verifier failure", async () => {
+		const controller = new AbortController();
+		const f = fixture([], {
+			signal: controller.signal,
+			verifier: async () => {
+				controller.abort();
+				throw new Error("aborted");
+			},
+		});
+		await f.setGoal("refactor auth");
+		await f.settle();
+		assert.equal(f.lastGoal()?.status, "user_paused");
+		assert.equal(f.lastGoal()?.autoTurns, 0);
+		assert.equal(f.lastGoal()?.lastVerification, undefined);
+	});
+
+	test("replacing a goal releases the old in-flight guard", async () => {
+		let resolveOld!: (verdict: GoalVerdict) => void;
+		const old = new Promise<GoalVerdict>((resolve) => {
+			resolveOld = resolve;
+		});
+		const f = fixture([], { verifier: async (objective) => (objective === "old" ? old : notDone()) });
+		await f.setGoal("old");
+		const settling = f.settle();
+		await f.cmd("new");
+		assert.equal((await f.settle())?.continue, true);
+		const latest = structuredClone(f.lastGoal()?.lastVerification);
+		resolveOld({ achieved: true, gaps: [], modelFixable: true });
+		assert.equal(await settling, undefined);
+		assert.equal(f.lastGoal()?.objective, "new");
+		assert.equal(f.lastGoal()?.status, "active");
+		assert.deepEqual(f.lastGoal()?.lastVerification, latest);
+	});
+
+	test("clear during baseline capture cannot resurrect an unfinished goal command", async () => {
+		let resolveExec!: (result: Awaited<ReturnType<ExtensionAPI["exec"]>>) => void;
+		const f = fixture([], {
+			exec: () =>
+				new Promise((resolve) => {
+					resolveExec = resolve;
+				}),
+		});
+		const setting = f.setGoal("refactor auth");
+		await Promise.resolve();
+		await Promise.resolve();
+		await f.cmd("clear");
+		resolveExec({ stdout: "abc123", stderr: "", code: 0, killed: false });
+		await setting;
+		assert.equal(f.sent.length, 0);
+		assert.equal(f.lastGoal()?.status, "cleared");
+	});
+});
+
+describe("goal arguments", () => {
+	test("invalid budgets never silently fall back or parse partially", async () => {
+		for (const value of ["", "0", "-2", "abc", "2.5", "2x", "9007199254740992", "1 --max-turns 2"]) {
+			const f = fixture([]);
+			await f.setGoal(`refactor auth --max-turns ${value}`);
+			assert.equal(f.lastGoal(), undefined, value);
+			assert.equal(f.sent.length, 0, value);
+		}
+	});
+
+	test("equals form is supported and stripped from objective", async () => {
+		const f = fixture([]);
+		await f.setGoal("--max-turns=3 refactor auth");
+		assert.equal(f.lastGoal()?.maxTurns, 3);
+		assert.equal(f.lastGoal()?.objective, "refactor auth");
+	});
+
+	test("objectives beginning with command names are not swallowed", async () => {
+		const f = fixture([]);
+		await f.setGoal("clear obsolete caches");
+		assert.equal(f.lastGoal()?.objective, "clear obsolete caches");
+		assert.equal(f.sent.length, 1);
+		assert.equal(f.lastGoal()?.lastVerification, undefined);
 	});
 });
 
@@ -396,5 +824,44 @@ describe("persistence discipline", () => {
 		await f.setGoal("status");
 		await f.settle();
 		assert.equal(f.sent.length, 1); // continued
+	});
+
+	test("tree navigation restores an active snapshot paused", async () => {
+		const f = fixture([]);
+		await f.setGoal("refactor auth");
+		const stored = f.lastGoal();
+		const restored = fixture([], {
+			entries: [{ customType: "pi-quest", data: stored }],
+			startReason: "reload",
+		});
+		await restored.setGoal("status");
+		await restored.fire("session_tree");
+		assert.equal(restored.lastGoal()?.status, "user_paused");
+		assert.equal(restored.sent.length, 0);
+	});
+
+	test("a later tombstone beats older invalid snapshots without persisting repairs", async () => {
+		const f = fixture([], {
+			entries: [
+				{
+					customType: "pi-quest",
+					data: {
+						objective: "old",
+						status: "invalid",
+						round: 0,
+						autoTurns: 0,
+						maxTurns: 1,
+						suspended: false,
+						cwd: "/tmp",
+						stallCount: 0,
+					},
+				},
+				{ customType: "pi-quest", data: { status: "cleared" } },
+			],
+		});
+		await f.setGoal("status");
+		assert.equal(f.entries.length, 0);
+		await f.settle();
+		assert.equal(f.sent.length, 0);
 	});
 });
