@@ -6,6 +6,19 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import {
+	type Accounting,
+	AccountingSchema,
+	accountingText,
+	emptyUsage,
+	finishRun,
+	newAccounting,
+	RecordsSchema,
+	recordUsage,
+	restoreAccounting,
+	restoreRecords,
+	type VerificationRecords,
+} from "./records.ts";
 import { captureBaseline, createSkepticVerifier, VerificationError, verificationFailure } from "./verifier.ts";
 
 const DEFAULT_MAX_TURNS = 20;
@@ -27,6 +40,7 @@ const VerificationSchema = Type.Object({
 	model: Type.Optional(Type.String({ maxLength: 200 })),
 	gaps: Type.Array(Type.String({ maxLength: TEXT_LIMIT }), { maxItems: GAPS_LIMIT }),
 	truncated: Type.Boolean(),
+	records: Type.Optional(RecordsSchema),
 	failure: Type.Optional(
 		Type.Object({
 			kind: Type.Union([
@@ -54,6 +68,7 @@ const GoalViewSchema = Type.Object({
 			lastGaps: Type.Array(Type.String({ maxLength: TEXT_LIMIT }), { maxItems: GAPS_LIMIT }),
 			pauseReason: Type.Optional(Type.String({ maxLength: TEXT_LIMIT })),
 			lastVerification: Type.Optional(VerificationSchema),
+			accounting: Type.Optional(AccountingSchema),
 			truncated: Type.Boolean(),
 		}),
 	]),
@@ -92,6 +107,7 @@ function restoreVerification(value: unknown, round: number): GoalVerification | 
 		failure = { kind, reason: verificationFailure(new VerificationError(kind)).reason };
 	}
 	const bounded = boundedGaps(raw.gaps as string[]);
+	const records = restoreRecords(raw.records);
 	return {
 		outcome: raw.outcome as GoalVerification["outcome"],
 		round: raw.round as number,
@@ -100,6 +116,7 @@ function restoreVerification(value: unknown, round: number): GoalVerification | 
 		truncated: raw.truncated || bounded.truncated,
 		...(typeof raw.model === "string" ? { model: raw.model.slice(0, 200) } : {}),
 		...(failure ? { failure } : {}),
+		...(records ? { records } : {}),
 	};
 }
 
@@ -126,6 +143,8 @@ export interface GoalState {
 	pauseReason?: string;
 	/** Bounded, branch-local summary; no raw subprocess diagnostics. */
 	lastVerification?: GoalVerification;
+	/** Reported estimates only; incomplete/cancelled runs remain unknown. */
+	accounting?: Accounting;
 }
 
 export interface GoalVerdict {
@@ -138,7 +157,12 @@ export interface GoalVerdict {
 	model?: string;
 }
 
-export type GoalVerifier = (objective: string, round: number, signal?: AbortSignal) => Promise<GoalVerdict>;
+export type GoalVerifier = (
+	objective: string,
+	round: number,
+	signal?: AbortSignal,
+	report?: (records: VerificationRecords) => void,
+) => Promise<GoalVerdict>;
 
 /** Builds the verifier for one goal (its cwd + baseline are baked in). */
 export type GoalVerifierFactory = (goal: GoalState, ctx: ExtensionContext) => GoalVerifier;
@@ -184,6 +208,9 @@ function restoreState(value: unknown): GoalState | undefined {
 		...(isGoalStatus(raw.status) ? {} : { pauseReason: "invalid persisted status" }),
 	};
 	delete restored.lastVerification;
+	delete restored.accounting;
+	const accounting = restoreAccounting(raw.accounting);
+	if (accounting) restored.accounting = accounting;
 	const verification = restoreVerification(raw.lastVerification, restored.round);
 	if (verification) restored.lastVerification = verification;
 	return restored;
@@ -208,6 +235,8 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	let goalVersion = 0;
 	let verificationAbort: AbortController | undefined;
 	let lastRunAborted = false;
+	let mainTurn: { goal: GoalState; startedAt: number } | undefined;
+	let wrapUpGoal: GoalState | undefined;
 
 	function goalView(): GoalView {
 		if (!goal) return { goal: null };
@@ -222,6 +251,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 				lastGaps: gaps.gaps,
 				...(goal.pauseReason ? { pauseReason: goal.pauseReason.slice(0, TEXT_LIMIT) } : {}),
 				...(goal.lastVerification ? { lastVerification: structuredClone(goal.lastVerification) } : {}),
+				...(goal.accounting ? { accounting: structuredClone(goal.accounting) } : {}),
 				truncated: gaps.truncated || goal.objective.length > 4096 || (goal.pauseReason?.length ?? 0) > TEXT_LIMIT,
 			},
 		};
@@ -231,7 +261,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		name: "quest_get_goal",
 		label: "Quest Goal",
 		description:
-			"Read the current goal, state, remaining continuations, verifier gaps and latest verification. Read-only; never starts, resumes, replaces or completes a goal. truncated=true marks omitted text.",
+			"Read the current goal, state, remaining continuations, verifier receipts and reported usage estimates. Missing metrics are unknown; receipts are not proof of the whole objective. Read-only; never starts, resumes, replaces or completes a goal. truncated=true marks omitted text.",
 		parameters: Type.Object({}, { additionalProperties: false }),
 		outputSchema: GoalViewSchema,
 		annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -246,6 +276,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	});
 
 	function invalidate(): number {
+		wrapUpGoal = undefined;
 		goalVersion += 1;
 		verificationAbort?.abort();
 		verificationAbort = undefined;
@@ -341,10 +372,17 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 			// goal. The round counts as unverified, the loop continues.
 			let verdict: GoalVerdict | undefined;
 			let failure: ReturnType<typeof verificationFailure> | undefined;
+			let records: VerificationRecords | undefined;
 			const startedAt = performance.now();
+			settledGoal.accounting ??= newAccounting();
+			const accounting = settledGoal.accounting;
+			accounting.verifier.runs += 1;
+			persist();
 			try {
 				if (!settledVerify) throw new Error("verifier unavailable");
-				verdict = await settledVerify(settledGoal.objective, settledGoal.round, signal);
+				verdict = await settledVerify(settledGoal.objective, settledGoal.round, signal, (value) => {
+					records = restoreRecords(value);
+				});
 			} catch (error) {
 				failure = verificationFailure(error);
 			}
@@ -363,6 +401,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 				transition("user_paused", "verification cancelled", ctx);
 				return;
 			}
+			finishRun(accounting.verifier, performance.now() - startedAt, records?.usage ?? emptyUsage());
 			if (ctx.hasPendingMessages()) {
 				persist();
 				return;
@@ -376,6 +415,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 				...boundedGaps(verdict?.gaps ?? []),
 				...(model ? { model: model.slice(0, 200) } : {}),
 				...(failure ? { failure: { kind: failure.kind, reason: failure.reason } } : {}),
+				...(records ? { records } : {}),
 			};
 			if (verdict) {
 				if (verdict.gaps.length > 0) goal.lastGaps = [...verdict.gaps];
@@ -409,6 +449,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 
 			if (goal.autoTurns >= goal.maxTurns) {
 				transition("budget_paused", `${goal.maxTurns} auto-continuations used up`, ctx);
+				wrapUpGoal = goal;
 				return boundaryContinuation(
 					event,
 					`[goal] Auto-paused after ${goal.maxTurns} continuations. ` +
@@ -449,9 +490,13 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 					? `\nVerification r${latest.round}: ${latest.outcome} | ${latest.durationMs}ms` +
 						(latest.model ? ` | ${latest.model}` : "") +
 						(latest.failure ? ` | ${latest.failure.kind}: ${latest.failure.reason}` : "") +
+						(latest.records
+							? `\nTool receipts: ${latest.records.toolCalls} | errors ${latest.records.failedCalls}` +
+								` | omitted ${latest.records.omitted} | stream ${latest.records.streamIncomplete ? "incomplete" : "complete"}`
+							: "") +
 						(latest.gaps.length ? `\n${latest.gaps.join("\n")}${latest.truncated ? "\n(truncated)" : ""}` : "")
 					: "";
-				ctx.ui.notify(text + verification, "info");
+				ctx.ui.notify(text + verification + (goal?.accounting ? `\n${accountingText(goal.accounting)}` : ""), "info");
 				return;
 			}
 			if (sub === "pause") {
@@ -530,6 +575,29 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	});
 
 	pi.on("agent_before_settle", onBeforeSettle);
+	pi.on("turn_start", () => {
+		mainTurn =
+			goal && ((goal.status === "active" && !goal.suspended) || wrapUpGoal === goal)
+				? { goal, startedAt: performance.now() }
+				: undefined;
+		wrapUpGoal = undefined;
+		if (mainTurn) {
+			mainTurn.goal.accounting ??= newAccounting();
+			mainTurn.goal.accounting.main.runs += 1;
+			persist();
+		}
+	});
+	pi.on("turn_end", (event) => {
+		const turn = mainTurn;
+		mainTurn = undefined;
+		if (!turn || goal !== turn.goal) return;
+		const usage = emptyUsage();
+		recordUsage(usage, event.message);
+		for (const result of event.toolResults) recordUsage(usage, result);
+		goal.accounting ??= newAccounting();
+		finishRun(goal.accounting.main, performance.now() - turn.startedAt, usage);
+		persist();
+	});
 
 	// Esc bypasses agent_before_settle. Observe cancellation without restarting
 	// from the notification-only agent_settled hook.
@@ -594,7 +662,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 }
 
 export default function quest(pi: ExtensionAPI): void {
-	createQuest(pi, (goal, ctx) => async (objective, round, signal) => {
+	createQuest(pi, (goal, ctx) => async (objective, round, signal, report) => {
 		// Virtual selections only exist in the host's extension runtime. Reuse
 		// the physical model that did the work, including its routed effort.
 		const entry = ctx.sessionManager
@@ -612,6 +680,6 @@ export default function quest(pi: ExtensionAPI): void {
 		return createSkepticVerifier((c, a, o) => pi.exec(c, a, o), goal, {
 			...(model ? { model } : {}),
 			...(thinkingLevel ? { thinkingLevel } : {}),
-		})(objective, round, signal);
+		})(objective, round, signal, report);
 	});
 }

@@ -13,6 +13,7 @@ import quest, {
 	type GoalVerifier,
 	type GoalView,
 } from "../src/index.ts";
+import { collectRecords } from "../src/records.ts";
 import { VerificationError } from "../src/verifier.ts";
 
 interface Sent {
@@ -182,6 +183,128 @@ function fixture(
 }
 
 const notDone = (gaps: string[] = []): GoalVerdict => ({ achieved: false, gaps, modelFixable: true });
+
+describe("execution accounting", () => {
+	const usage = {
+		input: 10,
+		output: 2,
+		cacheRead: 3,
+		cacheWrite: 1,
+		totalTokens: 16,
+		cost: { total: 0.01 },
+	};
+	const records = collectRecords(
+		[
+			JSON.stringify({ type: "message_end", message: { role: "assistant", usage } }),
+			JSON.stringify({ type: "agent_settled" }),
+		].join("\n"),
+	);
+
+	test("main and verifier remain separate; repeated event channels do not double-count", async () => {
+		const f = fixture([], {
+			verifier: async (_objective, _round, _signal, report) => {
+				report?.(records);
+				throw new VerificationError("output");
+			},
+		});
+		await f.setGoal("document API");
+		await f.fire("turn_start");
+		const message = { role: "assistant", usage };
+		const toolResult = { role: "toolResult", usage };
+		await f.fire("message_end", { message });
+		await f.fire("tool_execution_end", { result: { usage } });
+		const end = { message, toolResults: [toolResult] };
+		await f.fire("turn_end", end);
+		await f.fire("turn_end", end);
+		await f.fire("agent_end", { messages: [message, toolResult] });
+		await f.settle();
+		const snapshot = f.lastGoal();
+		assert.equal(snapshot?.accounting?.main.runs, 1);
+		assert.equal(snapshot?.accounting?.main.usage.totalTokens, 32);
+		assert.equal(snapshot?.accounting?.verifier.runs, 1);
+		assert.equal(snapshot?.accounting?.verifier.usage.totalTokens, 16);
+		assert.equal(snapshot?.lastVerification?.outcome, "unverified");
+		assert.deepEqual(snapshot?.lastVerification?.records, records);
+		const query = await f.query();
+		assert.ok(query.goal?.accounting);
+		query.goal.accounting.main.usage.totalTokens = 0;
+		assert.equal((await f.query()).goal?.accounting?.main.usage.totalTokens, 32);
+		await f.cmd("status");
+		assert.match(f.notifications.at(-1) ?? "", /main:.*tokens 32/);
+		assert.match(f.notifications.at(-1) ?? "", /verifier:.*tokens 16/);
+	});
+
+	test("cancelled verifier stays an incomplete attempt; late receipts cannot write summaries or usage", async () => {
+		let finish: (() => void) | undefined;
+		const f = fixture([], {
+			verifier: async (_objective, _round, _signal, report) => {
+				await new Promise<void>((resolve) => {
+					finish = resolve;
+				});
+				report?.(records);
+				return { achieved: true, gaps: [], modelFixable: true };
+			},
+		});
+		await f.setGoal("x");
+		const pending = f.settle();
+		await f.cmd("pause");
+		const entries = f.entries.length;
+		assert.ok(finish);
+		finish();
+		await pending;
+		assert.equal(f.entries.length, entries);
+		assert.equal(f.lastGoal()?.accounting?.verifier.runs, 1);
+		assert.equal(f.lastGoal()?.accounting?.verifier.completedRuns, 0);
+		assert.equal(f.lastGoal()?.accounting?.verifier.usage.totalTokens, undefined);
+		assert.equal(f.lastGoal()?.lastVerification, undefined);
+		await f.cmd("status");
+		assert.match(f.notifications.at(-1) ?? "", /unknown \(partial\)/);
+	});
+
+	test("branch restoration keeps accounting and receipts; invalid optional metadata is dropped", async () => {
+		const source = fixture([], {
+			verifier: async (_objective, _round, _signal, report) => {
+				report?.(records);
+				return notDone();
+			},
+		});
+		await source.setGoal("x");
+		await source.settle();
+		const state = source.lastGoal();
+		assert.ok(state);
+		const entries = [{ customType: "pi-quest", data: state }];
+		const restored = fixture([], { entries, branchEntries: entries });
+		await restored.fire("session_start");
+		assert.deepEqual((await restored.query()).goal?.accounting, state.accounting);
+		assert.deepEqual((await restored.query()).goal?.lastVerification?.records, records);
+		const invalid = fixture([], {
+			entries: [
+				{
+					customType: "pi-quest",
+					data: {
+						...state,
+						accounting: { leaked: "SECRET" },
+						lastVerification: { ...state.lastVerification, records: { ...records, stdout: "SECRET" } },
+					},
+				},
+			],
+		});
+		await invalid.fire("session_start");
+		assert.equal((await invalid.query()).goal?.accounting, undefined);
+		assert.equal((await invalid.query()).goal?.lastVerification?.records, undefined);
+		assert.ok((await invalid.query()).goal?.lastVerification);
+	});
+
+	test("late main results never charge replacement goals", async () => {
+		const f = fixture([notDone()]);
+		await f.setGoal("old");
+		await f.fire("turn_start");
+		await f.cmd("new");
+		await f.fire("turn_end", { message: { role: "assistant", usage }, toolResults: [] });
+		assert.equal(f.lastGoal()?.objective, "new");
+		assert.equal(f.lastGoal()?.accounting, undefined);
+	});
+});
 
 describe("goal query and verification summaries", () => {
 	test("query is read-only, detached, and explicitly reports no goal", async () => {

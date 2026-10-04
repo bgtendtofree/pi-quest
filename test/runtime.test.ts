@@ -11,7 +11,163 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { createQuest } from "../src/index.ts";
+import { Type } from "typebox";
+import { createQuest, type GoalState } from "../src/index.ts";
+import { collectRecords } from "../src/records.ts";
+
+test("native codemode preserves failed bash receipts and accounts nested model usage once", {
+	timeout: 15_000,
+}, async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-quest-receipts-"));
+	let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+	try {
+		const settingsManager = SettingsManager.inMemory({
+			compaction: { enabled: false },
+			retry: { enabled: false },
+			cacheWarming: "off",
+		});
+		const nestedUsage = {
+			input: 2,
+			output: 3,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 5,
+			cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+		};
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir: cwd,
+			settingsManager,
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+			extensionFactories: [
+				(pi) => createQuest(pi, () => async () => ({ achieved: true, gaps: [], modelFixable: true })),
+				createCodemodeExtension({ models: false }),
+				(pi) =>
+					pi.registerTool({
+						name: "metered",
+						label: "Metered",
+						description: "Mock nested model usage",
+						parameters: Type.Object({}),
+						async execute() {
+							return { content: [{ type: "text", text: "done" }], details: undefined, usage: nestedUsage };
+						},
+					}),
+			],
+		});
+		await resourceLoader.reload();
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(cwd, "auth.json"),
+			modelsPath: null,
+			modelsStorePath: join(cwd, "models-store.json"),
+			refreshOnCreate: false,
+		});
+		await modelRuntime.setRuntimeApiKey("openai", "test-only-no-network");
+		const model = modelRuntime.getModel("openai", "gpt-6.1-sol");
+		assert.ok(model);
+		const sessionManager = SessionManager.inMemory(cwd);
+		sessionManager.appendCustomEntry("pi-quest", {
+			objective: "inspect receipts",
+			status: "active",
+			round: 0,
+			autoTurns: 0,
+			maxTurns: 1,
+			suspended: false,
+			cwd,
+			stallCount: 0,
+		});
+		({ session } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			modelRuntime,
+			model,
+			resourceLoader,
+			settingsManager,
+			sessionManager,
+			sessionStartEvent: { type: "session_start", reason: "reload" },
+			tools: ["codemode", "bash", "metered"],
+		}));
+		await session.bindExtensions({ mode: "json" });
+		let requests = 0;
+		session.agent.streamFunction = async () => {
+			requests += 1;
+			const message = {
+				role: "assistant" as const,
+				content:
+					requests === 1
+						? [
+								{
+									type: "toolCall" as const,
+									id: "script",
+									name: "codemode",
+									arguments: {
+										code: 'const failed = await tools.bash({command: "printf receipt; exit 7"}); await tools.metered({}); return {claimed: "passed", exitCode: failed.exit_code};',
+									},
+								},
+							]
+						: [{ type: "text" as const, text: "all passed" }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 10,
+					output: 2,
+					cacheRead: 3,
+					cacheWrite: 1,
+					totalTokens: 16,
+					cost: { input: 0.005, output: 0.005, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+				},
+				stopReason: requests === 1 ? ("toolUse" as const) : ("stop" as const),
+				timestamp: Date.now(),
+			};
+			return {
+				async *[Symbol.asyncIterator]() {
+					if (message.stopReason === "toolUse") yield { type: "done" as const, reason: "toolUse" as const, message };
+					else yield { type: "done" as const, reason: "stop" as const, message };
+				},
+				result: async () => message,
+			};
+		};
+		const lines: string[] = [];
+		session.subscribe((event) => {
+			if (
+				[
+					"tool_execution_start",
+					"tool_execution_end",
+					"message_end",
+					"turn_end",
+					"agent_end",
+					"agent_settled",
+				].includes(event.type)
+			)
+				lines.push(JSON.stringify(event));
+		});
+		await session.prompt("start", { source: "extension" });
+		assert.equal(requests, 2);
+		const records = collectRecords(lines.join("\n") + "\n");
+		const bash = records.receipts.find((receipt) => receipt.tool === "bash");
+		assert.equal(bash?.status, "error");
+		assert.equal(bash?.exitCode, 7);
+		assert.equal(bash?.outputTruncated, false);
+		assert.equal(records.streamIncomplete, false);
+		assert.equal(records.usage.totalTokens, 37);
+		assert.equal(records.usage.nestedUsageReports, 1);
+		assert.equal(records.usage.estimatedCostUSD, 0.05);
+		const snapshot = sessionManager
+			.getBranch()
+			.findLast((entry) => entry.type === "custom" && entry.customType === "pi-quest");
+		const goal = (snapshot as { data: GoalState }).data;
+		assert.equal(goal.accounting?.main.usage.totalTokens, 37);
+		assert.equal(goal.accounting?.main.usage.nestedUsageReports, 1);
+		assert.equal(goal.accounting?.main.usage.estimatedCostUSD, 0.05);
+	} finally {
+		session?.dispose();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
 
 for (const scenario of [
 	{ achievedAfter: 3, status: "complete", requests: 3 },
@@ -126,6 +282,12 @@ for (const scenario of [
 				.findLast((entry) => entry.type === "custom" && entry.customType === "pi-quest");
 			assert.equal((snapshot as { data: { status: string; autoTurns: number } }).data.status, scenario.status);
 			assert.equal((snapshot as { data: { autoTurns: number } }).data.autoTurns, 2);
+			const accounting = (snapshot as { data: GoalState }).data.accounting;
+			assert.equal(accounting?.main.runs, scenario.requests);
+			assert.equal(accounting?.main.completedRuns, scenario.requests);
+			assert.equal(accounting?.verifier.runs, 3);
+			assert.equal(accounting?.verifier.completedRuns, 3);
+			assert.equal(accounting?.verifier.unreportedRuns, 3);
 		} finally {
 			session?.dispose();
 			await rm(cwd, { recursive: true, force: true });

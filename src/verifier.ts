@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { type ExecOptions, getPackageDir } from "@earendil-works/pi-coding-agent";
 import type { GoalState, GoalVerdict, GoalVerifier } from "./index.ts";
+import { collectRecords } from "./records.ts";
 
 /** Bounded exec signature the skeptic needs; pi.exec adapts onto it. */
 export type ExecFn = (
@@ -172,7 +173,7 @@ export function createSkepticVerifier(
 	goal: GoalState,
 	options: { model?: string; thinkingLevel?: string } = {},
 ): GoalVerifier {
-	const verify: GoalVerifier = async (objective, _round, signal) => {
+	const verify: GoalVerifier = async (objective, _round, signal, report) => {
 		signal?.throwIfAborted();
 		const diff = await captureDiff(exec, goal.cwd, goal.baselineCommit, signal);
 		signal?.throwIfAborted();
@@ -201,6 +202,7 @@ export function createSkepticVerifier(
 			timeout: SKEPTIC_TIMEOUT_MS,
 			...(signal ? { signal } : {}),
 		});
+		report?.(collectRecords(result.stdout));
 		signal?.throwIfAborted();
 		if (result.code !== 0 || result.killed) {
 			throw new VerificationError(result.killed ? "timeout" : "process", options.model);
@@ -245,9 +247,9 @@ export function createSkepticVerifier(
 		if (!verdict) throw new VerificationError("output", model);
 		return { ...verdict, ...(model ? { model: model.slice(0, 200) } : {}) };
 	};
-	return async (objective, round, signal) => {
+	return async (objective, round, signal, report) => {
 		try {
-			return await verify(objective, round, signal);
+			return await verify(objective, round, signal, report);
 		} catch (error) {
 			signal?.throwIfAborted();
 			if (error instanceof VerificationError) throw error;

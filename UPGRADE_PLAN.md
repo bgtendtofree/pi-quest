@@ -1,6 +1,6 @@
 # pi-quest 升级计划
 
-状态：P1 已实施；P2/P3 未实施。验收以当次 `mise run ci` 和交付记录为准。
+状态：P1/P2 已实施；P3 未实施。验收以当次 `mise run ci` 和交付记录为准。
 本文不授权安装第三方插件或修改用户 Pi 配置。
 
 ## 1. 定位与边界
@@ -90,6 +90,22 @@ pi-quest 只做单目标模式：
 ## 4. P2：验证证据与开销
 
 P1 完成后再实施。只存排错和评估所需数据，不建 observability 平台。
+
+实施口径：
+
+- `lastVerification.records` 采集真实子进程 JSONL 工具事件，每次最多保留 20 条；
+  缺失退出码、未完成调用、事件流缺失、输出截断均不伪装成通过。
+- 调用、参数、输出只保留 SHA-256 指纹，非可恢复日志路径；
+  不持久化原始命令、stdout、stderr 或原生日志路径。
+- 完整日志尚未证明必要，按第 8 节先只做摘要；不创建日志缓存或删除用户原生产物。
+  摘要随 session 历史保留，clear 写 tombstone 而非擦除历史；删除 session 文件才删除历史摘要。
+- `accounting.main` 按目标关联的 assistant turn 统计，含预算结束总结；
+  `accounting.verifier` 按独立验证尝试统计，含 diff/子进程/解析时间。
+- 只计 final assistant usage 和顶层 tool-result 汇总 usage；不累加流式增量、
+  重复 transcript 或嵌套 tool-execution usage。取消/过期尝试只保留开始计数，缺失耗时/usage 显示未知。
+- 保留 token 分项与报告覆盖计数；费用是 Pi 估算，零值占位或缺失显示未知，已知小计标记 partial。
+  compaction、branch summary、cache warming 和未报告的脚本/嵌套模型费用不在统计范围。
+- 不增加费用硬预算，不因任意命令失败替换 skeptic 的整体目标裁决，不启用 P3。
 
 ### 4.1 验证证据
 

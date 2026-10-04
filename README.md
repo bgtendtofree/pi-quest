@@ -51,7 +51,21 @@ The skeptic is instructed to assess **every objective requirement** as verified,
 
 `/goal status` and `quest_get_goal` show a bounded, branch-local `lastVerification` record: outcome (`verified-achieved`, `verified-incomplete`, or `unverified`), round, duration in milliseconds, model when known, and gaps or a failure category (`timeout`, `process`, `model`, `output`). Unknown model information is omitted, not inferred from the main session. Fixed failure descriptions replace raw stderr/provider/exception messages so credentials are not copied into session entries. Cancelled and stale verifications never overwrite the record. Old sessions without this optional field still restore.
 
-These outcomes report the independent skeptic's judgment, not a deterministic proof that all requirements were covered. Per-requirement assessment is a prompt contract; runtime collection of check receipts, full logs, and token/cost accounting remain future work.
+These outcomes report the independent skeptic's judgment, not a deterministic proof that all requirements were covered. Per-requirement assessment remains a prompt contract; execution receipts do not replace the independent verdict.
+
+### Execution receipts and usage
+
+`lastVerification.records` collects **actual child CLI events**, never claims in assistant prose. It keeps at most 20 tool receipts per verification, with total/failed/omitted counts and a `streamIncomplete` flag for missing settlement, malformed JSONL or unfinished calls. Failure totals include omitted receipts. Receipts retain tool/event source, status (`ok`, `error`, `unknown`, `unfinished`), reported exit code, duration and truncation when available. Bash requires a reported zero exit code and a non-error result to receive `ok`; absent exit information remains unknown. Failed receipts stay failed even if the final verdict claims success. An unrelated failed command does not automatically veto a goal.
+
+Call IDs, arguments and output are stored only as SHA-256 fingerprints (`callRef`, `argsRef`, `outputRef`). These identify received data, **not recoverable log paths or proof of requirement coverage**. Quest creates no full-output log cache, copies no raw command/output/path into receipts, and never reads or deletes native Pi logs. Missing native log files do not change goal state. Summaries live in branch-local session entries; `/goal clear` clears current state, not historical entries. Delete the session file to remove its retained history. Full-log retention remains deferred until needed.
+
+`accounting.main` and `accounting.verifier` are optional cumulative, branch-local records, available through `quest_get_goal` and `/goal status`:
+
+- Main runs are goal-owned assistant turns, including the budget wrap-up; duration spans model and tool execution, not idle time or verification.
+- Verifier runs are independent verification attempts, including diff capture, child execution and parsing. Failed attempts count once. Cancelled/stale attempts retain their start count but cannot publish late duration, usage or receipts; `completedRuns < runs` marks incomplete accounting.
+- Usage sums finalized assistant messages and **reported top-level tool-result usage**, once. Streaming deltas, `turn_end`/`agent_end` transcript copies and nested tool execution events are not additional charges. Verifier usage covers every response, not just the verdict.
+- Token fields keep input/output/cache-read/cache-write/total separate; reasoning tokens are already included in output. Missing or all-zero placeholder usage stays unknown. Cost is Pi's **estimate**, not an invoice; zero estimates stay unknown because unpriced models also report zero. Known subtotals with missing reports are marked partial.
+- Unreported nested model work, compaction/branch-summary calls, cache warming and model calls made externally by scripts are outside these counters. No token/cost hard budget or verifier codemode is enabled.
 
 The skeptic disables extensions (including built-in MCP/codemode), skills, prompt templates, context files, project trust, and background network activity. A failed, aborted, or truncated assistant response never completes a goal, even when JSON mode exits with code zero.
 

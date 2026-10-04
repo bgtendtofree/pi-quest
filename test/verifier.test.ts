@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { GoalState } from "../src/index.ts";
+import type { VerificationRecords } from "../src/records.ts";
 import {
 	buildSkepticPrompt,
 	captureBaseline,
@@ -383,6 +384,94 @@ describe("skeptic worktree verification", () => {
 		});
 		const result = await createSkepticVerifier(exec, goal, { model: "test/selected" })(goal.objective, 1);
 		assert.equal(result.model, "test/actual");
+	});
+
+	test("reports receipts and whole-run usage once before verdict or process failure", async () => {
+		const usage = {
+			input: 10,
+			output: 2,
+			cacheRead: 3,
+			cacheWrite: 1,
+			totalTokens: 16,
+			cost: { total: 0.01 },
+		};
+		const events = [
+			{ type: "message_update", usage },
+			{ type: "message_end", message: { role: "assistant", usage, stopReason: "toolUse" } },
+			{ type: "tool_execution_start", toolCallId: "check", toolName: "bash", args: { command: "check SECRET" } },
+			{
+				type: "tool_execution_end",
+				toolCallId: "check",
+				toolName: "bash",
+				isError: true,
+				result: {
+					content: [{ type: "text", text: "SECRET failed" }],
+					structuredContent: { output: "SECRET failed", exit_code: 1, truncated: false, wall_time_seconds: 0.2 },
+				},
+			},
+			{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					usage,
+					stopReason: "stop",
+					content: [{ type: "text", text: 'all passed\n{"achieved":true,"gaps":[]}' }],
+				},
+			},
+			{ type: "agent_settled" },
+		];
+		for (const result of [
+			{ code: 0, killed: false },
+			{ code: 1, killed: false },
+			{ code: 0, killed: true },
+		]) {
+			const reports: VerificationRecords[] = [];
+			const exec: ExecFn = async (command) =>
+				command === "git"
+					? { stdout: "", stderr: "", code: 0, killed: false }
+					: {
+							stdout: events.map((event) => JSON.stringify(event)).join("\n") + "\n",
+							stderr: "SECRET stderr",
+							...result,
+						};
+			const pending = createSkepticVerifier(exec, goal)(goal.objective, 1, undefined, (report) => reports.push(report));
+			if (result.code || result.killed) await assert.rejects(pending, /skeptic exited/);
+			else assert.equal((await pending).achieved, true, "receipts do not replace independent verdict policy");
+			assert.equal(reports.length, 1);
+			assert.equal(reports[0]?.usage.assistantResponses, 2);
+			assert.equal(reports[0]?.usage.totalTokens, 32);
+			assert.equal(reports[0]?.usage.estimatedCostUSD, 0.02);
+			assert.equal(reports[0]?.receipts[0]?.status, "error", "success prose cannot rewrite receipts");
+			assert.doesNotMatch(JSON.stringify(reports), /SECRET/);
+		}
+	});
+
+	test("partial child receipts are observable on cancellation but never turn into a verdict", async () => {
+		const controller = new AbortController();
+		const reports: VerificationRecords[] = [];
+		const exec: ExecFn = async (command) => {
+			if (command === "git") return { stdout: "", stderr: "", code: 0, killed: false };
+			controller.abort();
+			return {
+				stdout:
+					JSON.stringify({
+						type: "tool_execution_start",
+						toolCallId: "read",
+						toolName: "read",
+						args: { path: "README.md" },
+					}) + "\n",
+				stderr: "",
+				code: 0,
+				killed: true,
+			};
+		};
+		await assert.rejects(
+			createSkepticVerifier(exec, goal)(goal.objective, 1, controller.signal, (report) => reports.push(report)),
+			{ name: "AbortError" },
+		);
+		assert.equal(reports.length, 1);
+		assert.equal(reports[0]?.streamIncomplete, true);
+		assert.equal(reports[0]?.receipts[0]?.status, "unfinished");
 	});
 });
 
