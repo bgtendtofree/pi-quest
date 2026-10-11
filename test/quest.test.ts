@@ -380,7 +380,8 @@ describe("goal query and verification summaries", () => {
 		assert.equal(snapshot?.lastVerification?.truncated, true);
 		assert.ok(JSON.stringify(snapshot).length < 16_000);
 		assert.equal(f.lastGoal()?.objective, objective);
-		assert.deepEqual(f.lastGoal()?.lastGaps, gaps);
+		assert.equal(f.lastGoal()?.lastGaps?.length, 10);
+		assert.equal(f.lastGoal()?.lastGaps?.[0]?.length, 512);
 	});
 
 	test("success and blocked records carry model and current gaps; completion clears stale gaps", async () => {
@@ -1034,13 +1035,50 @@ describe("persistence discipline", () => {
 		assert.ok(f.notifications.every((text) => text.length < 700));
 	});
 
-	test("continuation injects bounded gaps even though the store keeps them all", async () => {
+	test("continuation and the persisted store both keep gaps bounded", async () => {
 		const gaps = Array.from({ length: 25 }, (_, index) => `${index}-`.padEnd(2000, "x"));
 		const f = fixture([notDone(gaps)]);
 		await f.setGoal("refactor auth");
 		await f.settle();
-		assert.equal(f.lastGoal()?.lastGaps?.length, 25); // store is unchanged
+		assert.equal(f.lastGoal()?.lastGaps?.length, 10);
+		assert.equal(f.lastGoal()?.lastGaps?.[0]?.length, 512);
 		assert.ok((f.sent.at(-1)?.content.length ?? 0) < 6000, "continuation stays small");
+	});
+
+	test("a turn persists once, not twice", async () => {
+		const f = fixture([notDone()]);
+		await f.setGoal("refactor auth");
+		const afterSet = f.entries.length;
+		await f.fire("turn_start");
+		assert.equal(f.entries.length, afterSet, "turn_start stays in memory");
+		await f.fire("turn_end", { message: { role: "assistant", content: [] }, toolResults: [] });
+		assert.equal(f.entries.length, afterSet + 1, "turn_end is the single write");
+	});
+
+	test("an unchanged worktree skips the skeptic and pauses as no progress", async () => {
+		let verified = 0;
+		const exec = ((_command: string, args: string[]) =>
+			Promise.resolve(
+				args.includes("rev-parse")
+					? { stdout: "abc123\n", stderr: "", code: 0, killed: false }
+					: { stdout: "", stderr: "", code: 0, killed: false },
+			)) as ExtensionAPI["exec"];
+		const f = fixture([], {
+			exec,
+			verifier: async () => {
+				verified += 1;
+				return notDone(["still broken"]);
+			},
+		});
+		await f.setGoal("refactor auth");
+		await f.settle();
+		assert.equal(verified, 1);
+		assert.equal(f.lastGoal()?.status, "active");
+		assert.ok(f.lastGoal()?.lastVerifiedState, "fingerprint stored after a real verification");
+		await f.settle();
+		assert.equal(verified, 1, "identical worktree skips the skeptic");
+		assert.equal(f.lastGoal()?.status, "no_progress_paused");
+		assert.match(f.lastGoal()?.pauseReason ?? "", /unchanged/);
 	});
 
 	test("restored state drops unknown keys and unvalidated baselines", async () => {

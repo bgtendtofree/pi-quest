@@ -19,7 +19,13 @@ import {
 	restoreRecords,
 	type VerificationRecords,
 } from "./records.ts";
-import { captureBaseline, createSkepticVerifier, VerificationError, verificationFailure } from "./verifier.ts";
+import {
+	captureBaseline,
+	captureWorktreeState,
+	createSkepticVerifier,
+	VerificationError,
+	verificationFailure,
+} from "./verifier.ts";
 
 const DEFAULT_MAX_TURNS = 20;
 // Sanity cap: the turn budget is the only hard stop, so a runaway value
@@ -143,6 +149,8 @@ export interface GoalState {
 	baselineCommit?: string;
 	lastGapFingerprint?: string;
 	lastGaps?: string[];
+	/** Worktree fingerprint at the last real verification; an identical tree skips the next skeptic. */
+	lastVerifiedState?: string;
 	stallCount: number;
 	/** Human-readable why, set on paused-family transitions. */
 	pauseReason?: string;
@@ -203,6 +211,7 @@ function restoreState(value: unknown): GoalState | undefined {
 		(raw.stallCount as number) < 0 ||
 		(raw.baselineCommit !== undefined && typeof raw.baselineCommit !== "string") ||
 		(raw.lastGapFingerprint !== undefined && typeof raw.lastGapFingerprint !== "string") ||
+		(raw.lastVerifiedState !== undefined && typeof raw.lastVerifiedState !== "string") ||
 		(raw.lastGaps !== undefined &&
 			(!Array.isArray(raw.lastGaps) || !raw.lastGaps.every((gap) => typeof gap === "string"))) ||
 		(raw.pauseReason !== undefined && typeof raw.pauseReason !== "string")
@@ -223,6 +232,9 @@ function restoreState(value: unknown): GoalState | undefined {
 			: {}),
 		...(typeof raw.lastGapFingerprint === "string" ? { lastGapFingerprint: raw.lastGapFingerprint } : {}),
 		...(Array.isArray(raw.lastGaps) ? { lastGaps: raw.lastGaps as string[] } : {}),
+		...(typeof raw.lastVerifiedState === "string" && raw.lastVerifiedState.length <= 64
+			? { lastVerifiedState: raw.lastVerifiedState }
+			: {}),
 		...(statusInvalid
 			? { pauseReason: "invalid persisted status" }
 			: typeof raw.pauseReason === "string"
@@ -386,6 +398,36 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		const signal = ctx.signal ? AbortSignal.any([controller.signal, ctx.signal]) : controller.signal;
 		try {
 			settledGoal.round += 1;
+			// A round that leaves the worktree byte-identical to the last verified
+			// state cannot change the verdict, so skip the 1-2 min skeptic. Gap
+			// wording can drift between runs; the tree cannot.
+			const priorVerification = settledGoal.lastVerification;
+			let worktreeState: string | undefined;
+			if (settledVerify) {
+				worktreeState = await captureWorktreeState((c, a, o) => pi.exec(c, a, o), settledGoal.cwd, signal);
+			}
+			if (
+				worktreeState !== undefined &&
+				worktreeState === settledGoal.lastVerifiedState &&
+				priorVerification?.outcome === "verified-incomplete"
+			) {
+				const gaps = boundedGaps(settledGoal.lastGaps ?? []);
+				settledGoal.lastVerification = {
+					outcome: "verified-incomplete",
+					round: settledGoal.round,
+					durationMs: 0,
+					...gaps,
+					...(priorVerification.model ? { model: priorVerification.model } : {}),
+				};
+				settledGoal.stallCount += 1;
+				if (settledGoal.stallCount >= STALL_THRESHOLD) {
+					transition("no_progress_paused", "worktree unchanged since the last verification", ctx);
+					return;
+				}
+				persist();
+				const skipText = continuation(ctx);
+				return skipText ? boundaryContinuation(event, skipText) : undefined;
+			}
 			// The skeptic runs 1-2 min; without this the UI looks hung (live-test lesson).
 			ctx.ui.setStatus("pi-quest", `🎯 r${settledGoal.round} verifying…`);
 
@@ -423,6 +465,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 				return;
 			}
 			finishRun(accounting.verifier, performance.now() - startedAt, records?.usage ?? emptyUsage());
+			if (verdict && worktreeState) settledGoal.lastVerifiedState = worktreeState;
 			if (ctx.hasPendingMessages()) {
 				persist();
 				return;
@@ -439,7 +482,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 				...(records ? { records } : {}),
 			};
 			if (verdict) {
-				if (verdict.gaps.length > 0) goal.lastGaps = [...verdict.gaps];
+				if (verdict.gaps.length > 0) goal.lastGaps = boundedGaps(verdict.gaps).gaps;
 				else delete goal.lastGaps;
 			}
 			if (verdict?.achieved) {
@@ -537,6 +580,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 					goal.suspended = false;
 					goal.stallCount = 0;
 					delete goal.lastGapFingerprint;
+					delete goal.lastVerifiedState;
 					verify = makeVerifier(goal, ctx);
 					transition("active", undefined, ctx);
 					const text = continuation(ctx);
@@ -605,7 +649,6 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		if (mainTurn) {
 			mainTurn.goal.accounting ??= newAccounting();
 			mainTurn.goal.accounting.main.runs += 1;
-			persist();
 		}
 	});
 	pi.on("turn_end", (event) => {

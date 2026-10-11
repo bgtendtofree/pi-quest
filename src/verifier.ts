@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,13 +63,17 @@ function tryVerdict(candidate: string): GoalVerdict | undefined {
 		if (raw.model_fixable !== undefined && typeof raw.model_fixable !== "boolean") return;
 		if (raw.blocker !== undefined && raw.blocker !== null && typeof raw.blocker !== "string") return;
 		const gaps = raw.gaps.map((gap: string) => gap.trim()).filter(Boolean);
+		const blocker = typeof raw.blocker === "string" && raw.blocker.trim() ? raw.blocker.trim() : undefined;
 		// Fixability only decides continuation vs blocking for unmet goals.
-		if (raw.achieved && (gaps.length > 0 || raw.blocker)) return;
+		if (raw.achieved && (gaps.length > 0 || blocker)) return;
+		// "Not achieved, not fixable, nothing named" leaves the user no action to
+		// take: incoherent, so treat it as an unparseable verdict (fail open).
+		if (!raw.achieved && raw.model_fixable === false && gaps.length === 0 && !blocker) return;
 		return {
 			achieved: raw.achieved,
 			gaps,
 			modelFixable: typeof raw.model_fixable === "boolean" ? raw.model_fixable : true,
-			...(typeof raw.blocker === "string" && raw.blocker ? { blocker: raw.blocker } : {}),
+			...(blocker ? { blocker } : {}),
 		};
 	} catch {
 		return;
@@ -316,6 +321,33 @@ export async function captureBaseline(exec: ExecFn, cwd: string): Promise<string
 		const result = await exec("git", ["rev-parse", "HEAD"], { cwd, timeout: 10_000 });
 		const sha = result.stdout.trim();
 		return result.code === 0 && sha ? sha : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Fingerprint of the worktree at a point in time (HEAD + status + diff). Two
+ * equal fingerprints mean nothing changed, so re-running the skeptic cannot
+ * change the verdict. Best-effort: undefined outside a git repo or on failure.
+ */
+export async function captureWorktreeState(
+	exec: ExecFn,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	try {
+		const opts = { cwd, timeout: 10_000, ...(signal ? { signal } : {}) };
+		const head = await exec("git", ["rev-parse", "HEAD"], opts);
+		if (head.code !== 0 || head.killed) return undefined;
+		const status = await exec("git", ["status", "--porcelain", "--untracked-files=all"], opts);
+		if (status.code !== 0 || status.killed) return undefined;
+		const diff = await exec("git", ["diff", "--no-ext-diff", "--no-textconv", "--"], opts);
+		if (diff.code !== 0 || diff.killed) return undefined;
+		return createHash("sha256")
+			.update(`${head.stdout.trim()}\u0000${status.stdout}\u0000${diff.stdout}`)
+			.digest("hex")
+			.slice(0, 32);
 	} catch {
 		return undefined;
 	}

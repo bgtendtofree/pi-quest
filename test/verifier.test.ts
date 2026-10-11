@@ -76,6 +76,16 @@ describe("parseVerdict", () => {
 		assert.equal(parseVerdict('{"achieved": true, "gaps": [], "blocker": "needs credentials"}'), undefined);
 		assert.equal(parseVerdict('{"achieved": false, "gaps": [], "model_fixable": "no"}'), undefined);
 		assert.equal(parseVerdict('{"achieved": false, "gaps": [], "blocker": 42}'), undefined);
+		// "not achieved, not fixable, nothing named" gives the user no action: incoherent.
+		assert.equal(parseVerdict('{"achieved": false, "gaps": [], "model_fixable": false, "blocker": null}'), undefined);
+		assert.equal(parseVerdict('{"achieved": false, "gaps": [], "model_fixable": false}'), undefined);
+		// A blocker makes the same shape coherent, and an empty-gap incomplete
+		// verdict stays accepted on the fail-open continuation path.
+		assert.equal(
+			parseVerdict('{"achieved": false, "gaps": [], "model_fixable": false, "blocker": "needs creds"}')?.blocker,
+			"needs creds",
+		);
+		assert.equal(parseVerdict('{"achieved": false, "gaps": [], "model_fixable": true}')?.achieved, false);
 	});
 
 	test("unparseable output returns undefined (caller treats as fail-open)", () => {
