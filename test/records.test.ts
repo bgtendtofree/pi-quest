@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import {
 	accountingText,
@@ -20,6 +22,63 @@ const usage = {
 	totalTokens: 16,
 	cost: { total: 0.01 },
 };
+
+test("nested codemode records keep parent identity and safe native log references, never arbitrary paths", () => {
+	const nativeFile = "pi-bash-0123456789abcdef.log";
+	const records = collectRecords(
+		jsonl([
+			{ type: "tool_execution_start", toolCallId: "parent", toolName: "codemode", args: { code: "SECRET" } },
+			{ type: "tool_execution_start", toolCallId: "child", toolName: "bash", parentToolCallId: "parent" },
+			{
+				type: "tool_execution_end",
+				toolCallId: "child",
+				toolName: "bash",
+				isError: true,
+				result: {
+					content: [],
+					structuredContent: { exit_code: 1, truncated: true, full_output_path: join(tmpdir(), nativeFile) },
+				},
+			},
+			{
+				type: "tool_execution_end",
+				toolCallId: "parent",
+				toolName: "codemode",
+				isError: false,
+				result: {
+					content: [],
+					details: { fullOutputPath: join(tmpdir(), "pi-codemode-0123456789abcdef.txt") },
+				},
+			},
+			{
+				type: "tool_execution_end",
+				toolCallId: "bad-path",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [],
+					details: { fullOutputPath: "/SECRET/path.log" },
+				},
+			},
+			{ type: "agent_settled" },
+		]),
+	);
+	assert.equal(records.receipts[0]?.tool, "codemode");
+	assert.equal(records.receipts[0]?.outputTruncated, true);
+	assert.equal(records.receipts[1]?.parentRef, records.receipts[0]?.callRef);
+	assert.equal(
+		records.receipts[1]?.fullOutputFile,
+		nativeFile,
+		"path needn't exist; no log reads or completion inference",
+	);
+	assert.equal(records.receipts[2]?.fullOutputFile, undefined);
+	assert.equal(records.failedCalls, 1);
+	assert.doesNotMatch(JSON.stringify(records), /SECRET/);
+	assert.deepEqual(restoreRecords(records), records);
+	assert.equal(
+		restoreRecords({ ...records, receipts: [{ ...records.receipts[0], fullOutputFile: "../secret" }] }),
+		undefined,
+	);
+});
 
 test("receipts preserve real failures despite successful prose; usage uses final messages only", () => {
 	const message = { role: "assistant", content: "all passed\u2028really", usage };
@@ -62,6 +121,15 @@ test("receipts preserve real failures despite successful prose; usage uses final
 	assert.equal(records.usage.estimatedCostUSD, 0.02);
 	assert.doesNotMatch(JSON.stringify(records), /SECRET|missing/);
 	assert.deepEqual(restoreRecords(records), records);
+});
+
+test("incoherent usage is rejected by restoreRecords just like restoreAccounting", () => {
+	const records = collectRecords(
+		jsonl([{ type: "message_end", message: { role: "assistant", usage } }, { type: "agent_settled" }]),
+	);
+	assert.deepEqual(restoreRecords(records), records);
+	assert.equal(restoreRecords({ ...records, usage: { ...records.usage, tokenReports: 5 } }), undefined);
+	assert.equal(restoreRecords({ ...records, usage: { ...records.usage, costReports: 5 } }), undefined);
 });
 
 test("missing exits, malformed streams and unfinished calls never become passed checks", () => {

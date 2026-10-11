@@ -46,6 +46,10 @@ function createPi(): {
 		registerTool(tool: ToolDefinition) {
 			tools.set(tool.name, tool);
 		},
+		registerFlag() {},
+		getFlag() {
+			return false;
+		},
 		sendUserMessage(content: string, options?: Sent["options"]) {
 			sent.push({ content, options });
 			return Promise.resolve();
@@ -468,59 +472,72 @@ describe("goal query and verification summaries", () => {
 	});
 });
 
-test("default verifier follows the latest physical model, not the virtual selection", async () => {
-	const { pi, handlers, commands } = createPi();
-	let spawned = false;
-	pi.exec = async (command, args) => {
-		if (command === "git") return { stdout: "abc123", stderr: "", code: 0, killed: false };
-		spawned = true;
-		assert.equal(args[args.indexOf("--model") + 1], "openai/gpt-6.1-sol");
-		assert.equal(args[args.indexOf("--thinking") + 1], "high");
-		return {
-			stdout: JSON.stringify({
-				type: "message_end",
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: '{"achieved": true, "gaps": []}' }],
-					stopReason: "stop",
-				},
-			}),
-			stderr: "",
-			code: 0,
-			killed: false,
+for (const codemode of [false, true]) {
+	test(`default verifier follows physical model with codemode ${codemode ? "opt-in" : "off"}`, async () => {
+		const { pi, handlers, commands } = createPi();
+		pi.registerFlag = (name, options) => {
+			assert.equal(name, "quest-verifier-codemode");
+			assert.equal(options.default, false);
 		};
-	};
-	quest(pi);
-	const ctx = {
-		cwd: "/tmp/quest-test",
-		model: { api: "pi-virtual", provider: "router", id: "auto" },
-		thinkingLevel: "low",
-		ui: { setStatus: () => {}, notify: () => {} },
-		hasPendingMessages: () => false,
-		sessionManager: {
-			getBranch: () => [
-				{
-					type: "message",
+		pi.getFlag = (name) => {
+			assert.equal(name, "quest-verifier-codemode");
+			return codemode;
+		};
+		let spawned = false;
+		pi.exec = async (command, args) => {
+			if (command === "git") return { stdout: "abc123", stderr: "", code: 0, killed: false };
+			spawned = true;
+			assert.equal(args[args.indexOf("--model") + 1], "openai/gpt-6.1-sol");
+			assert.equal(args[args.indexOf("--thinking") + 1], "high");
+			assert.equal(args.includes("-e"), codemode);
+			assert.equal(args[args.indexOf("--tools") + 1], `read,grep,find,ls,bash${codemode ? ",codemode" : ""}`);
+			if (codemode) assert.match(args[args.indexOf("-e") + 1] ?? "", /verifier-codemode\.ts$/);
+			return {
+				stdout: JSON.stringify({
+					type: "message_end",
 					message: {
 						role: "assistant",
-						provider: "openai",
-						model: "gpt-6.1-sol",
-						thinkingLevel: "high",
+						content: [{ type: "text", text: '{"achieved": true, "gaps": []}' }],
 						stopReason: "stop",
 					},
-				},
-			],
-		},
-	};
-	await commands.get("goal")?.("refactor auth", ctx as never);
-	for (const handler of handlers.get("agent_before_settle") ?? []) {
-		await handler(
-			{ entries: [], continue: false, context: { pendingMessages: [] }, outcome: "completed" } as never,
-			ctx as never,
-		);
-	}
-	assert.equal(spawned, true);
-});
+				}),
+				stderr: "",
+				code: 0,
+				killed: false,
+			};
+		};
+		quest(pi);
+		const ctx = {
+			cwd: "/tmp/quest-test",
+			model: { api: "pi-virtual", provider: "router", id: "auto" },
+			thinkingLevel: "low",
+			ui: { setStatus: () => {}, notify: () => {} },
+			hasPendingMessages: () => false,
+			sessionManager: {
+				getBranch: () => [
+					{
+						type: "message",
+						message: {
+							role: "assistant",
+							provider: "openai",
+							model: "gpt-6.1-sol",
+							thinkingLevel: "high",
+							stopReason: "stop",
+						},
+					},
+				],
+			},
+		};
+		await commands.get("goal")?.("refactor auth", ctx as never);
+		for (const handler of handlers.get("agent_before_settle") ?? []) {
+			await handler(
+				{ entries: [], continue: false, context: { pendingMessages: [] }, outcome: "completed" } as never,
+				ctx as never,
+			);
+		}
+		assert.equal(spawned, true);
+	});
+}
 
 describe("loop", () => {
 	test("setting a goal kicks off work immediately", async () => {
@@ -807,7 +824,18 @@ describe("user control", () => {
 
 describe("goal arguments", () => {
 	test("invalid budgets never silently fall back or parse partially", async () => {
-		for (const value of ["", "0", "-2", "abc", "2.5", "2x", "9007199254740992", "1 --max-turns 2"]) {
+		for (const value of [
+			"",
+			"0",
+			"-2",
+			"abc",
+			"2.5",
+			"2x",
+			"9007199254740991",
+			"9007199254740992",
+			"1001",
+			"1 --max-turns 2",
+		]) {
 			const f = fixture([]);
 			await f.setGoal(`refactor auth --max-turns ${value}`);
 			assert.equal(f.lastGoal(), undefined, value);
@@ -820,6 +848,15 @@ describe("goal arguments", () => {
 		await f.setGoal("--max-turns=3 refactor auth");
 		assert.equal(f.lastGoal()?.maxTurns, 3);
 		assert.equal(f.lastGoal()?.objective, "refactor auth");
+	});
+
+	test("the sanity cap is inclusive at its boundary", async () => {
+		const atCap = fixture([]);
+		await atCap.setGoal("refactor auth --max-turns 1000");
+		assert.equal(atCap.lastGoal()?.maxTurns, 1000);
+		const overCap = fixture([]);
+		await overCap.setGoal("refactor auth --max-turns 1001");
+		assert.equal(overCap.lastGoal(), undefined);
 	});
 
 	test("objectives beginning with command names are not swallowed", async () => {
@@ -986,5 +1023,60 @@ describe("persistence discipline", () => {
 		assert.equal(f.entries.length, 0);
 		await f.settle();
 		assert.equal(f.sent.length, 0);
+	});
+
+	test("oversized verifier text is bounded before it is persisted or notified", async () => {
+		const f = fixture([{ achieved: false, gaps: ["needs creds"], modelFixable: false, blocker: "b".repeat(5000) }]);
+		await f.setGoal("refactor auth");
+		await f.settle();
+		assert.equal(f.lastGoal()?.status, "blocked");
+		assert.equal(f.lastGoal()?.pauseReason?.length, 512);
+		assert.ok(f.notifications.every((text) => text.length < 700));
+	});
+
+	test("continuation injects bounded gaps even though the store keeps them all", async () => {
+		const gaps = Array.from({ length: 25 }, (_, index) => `${index}-`.padEnd(2000, "x"));
+		const f = fixture([notDone(gaps)]);
+		await f.setGoal("refactor auth");
+		await f.settle();
+		assert.equal(f.lastGoal()?.lastGaps?.length, 25); // store is unchanged
+		assert.ok((f.sent.at(-1)?.content.length ?? 0) < 6000, "continuation stays small");
+	});
+
+	test("restored state drops unknown keys and unvalidated baselines", async () => {
+		const stored = {
+			objective: "refactor auth",
+			status: "active",
+			round: 2,
+			autoTurns: 1,
+			maxTurns: 20,
+			suspended: false,
+			cwd: "/tmp/quest-test",
+			stallCount: 0,
+			baselineCommit: "--ext-diff",
+			injectedKey: "boom",
+		};
+		const f = fixture([], { entries: [{ customType: "pi-quest", data: stored }], startReason: "resume" });
+		await f.setGoal("status");
+		const restored = f.lastGoal();
+		assert.equal(restored?.status, "user_paused");
+		assert.equal(restored?.baselineCommit, undefined);
+		assert.equal(restored ? "injectedKey" in restored : false, false);
+	});
+
+	test("restored state with an over-cap turn budget is rejected", async () => {
+		const stored = {
+			objective: "refactor auth",
+			status: "user_paused",
+			round: 2,
+			autoTurns: 1,
+			maxTurns: 100_000,
+			suspended: false,
+			cwd: "/tmp/quest-test",
+			stallCount: 0,
+		};
+		const f = fixture([], { entries: [{ customType: "pi-quest", data: stored }] });
+		await f.setGoal("status");
+		assert.equal(f.lastGoal(), undefined);
 	});
 });

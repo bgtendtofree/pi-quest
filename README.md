@@ -57,7 +57,7 @@ These outcomes report the independent skeptic's judgment, not a deterministic pr
 
 `lastVerification.records` collects **actual child CLI events**, never claims in assistant prose. It keeps at most 20 tool receipts per verification, with total/failed/omitted counts and a `streamIncomplete` flag for missing settlement, malformed JSONL or unfinished calls. Failure totals include omitted receipts. Receipts retain tool/event source, status (`ok`, `error`, `unknown`, `unfinished`), reported exit code, duration and truncation when available. Bash requires a reported zero exit code and a non-error result to receive `ok`; absent exit information remains unknown. Failed receipts stay failed even if the final verdict claims success. An unrelated failed command does not automatically veto a goal.
 
-Call IDs, arguments and output are stored only as SHA-256 fingerprints (`callRef`, `argsRef`, `outputRef`). These identify received data, **not recoverable log paths or proof of requirement coverage**. Quest creates no full-output log cache, copies no raw command/output/path into receipts, and never reads or deletes native Pi logs. Missing native log files do not change goal state. Summaries live in branch-local session entries; `/goal clear` clears current state, not historical entries. Delete the session file to remove its retained history. Full-log retention remains deferred until needed.
+Call IDs, arguments and output are stored only as SHA-256 fingerprints (`callRef`, `argsRef`, `outputRef`); nested calls also retain a hashed `parentRef`. These fingerprints identify received data, **not recoverable logs or proof of requirement coverage**. When Pi spills output, `fullOutputFile` retains only a validated native filename (`pi-bash-<hex>.log` or `pi-codemode-<hex>.txt`) inside Node's `os.tmpdir()`, not arbitrary paths. Availability is unknown: the file can disappear or belong to an earlier machine/session. Quest creates no full-output log cache, copies no raw command/output into receipts, and never reads or deletes native Pi logs. Native logs may contain sensitive output; retention and cleanup remain with Pi/the OS/user. Missing files do not change goal state. Summaries live in branch-local session entries; `/goal clear` clears current state, not historical entries. Delete the session file to remove its retained history.
 
 `accounting.main` and `accounting.verifier` are optional cumulative, branch-local records, available through `quest_get_goal` and `/goal status`:
 
@@ -65,9 +65,31 @@ Call IDs, arguments and output are stored only as SHA-256 fingerprints (`callRef
 - Verifier runs are independent verification attempts, including diff capture, child execution and parsing. Failed attempts count once. Cancelled/stale attempts retain their start count but cannot publish late duration, usage or receipts; `completedRuns < runs` marks incomplete accounting.
 - Usage sums finalized assistant messages and **reported top-level tool-result usage**, once. Streaming deltas, `turn_end`/`agent_end` transcript copies and nested tool execution events are not additional charges. Verifier usage covers every response, not just the verdict.
 - Token fields keep input/output/cache-read/cache-write/total separate; reasoning tokens are already included in output. Missing or all-zero placeholder usage stays unknown. Cost is Pi's **estimate**, not an invoice; zero estimates stay unknown because unpriced models also report zero. Known subtotals with missing reports are marked partial.
-- Unreported nested model work, compaction/branch-summary calls, cache warming and model calls made externally by scripts are outside these counters. No token/cost hard budget or verifier codemode is enabled.
+- Unreported nested model work, compaction/branch-summary calls, cache warming and model calls made externally by scripts are outside these counters. No token/cost hard budget is enabled.
 
-The skeptic disables extensions (including built-in MCP/codemode), skills, prompt templates, context files, project trust, and background network activity. A failed, aborted, or truncated assistant response never completes a goal, even when JSON mode exits with code zero.
+The skeptic disables discovered extensions (including built-in MCP/codemode), skills, prompt templates, context files, project trust, and background network activity. Experimental codemode, below, is the only explicitly loaded exception. A failed, aborted, or truncated assistant response never completes a goal, even when JSON mode exits with code zero.
+
+### Experimental verifier codemode (default off)
+
+Opt in for one host invocation:
+
+```sh
+pi --quest-verifier-codemode
+# Explicit extension loading:
+pi -e ./src/index.ts --quest-verifier-codemode
+```
+
+Omit the flag to use the original verifier. It does not change `/goal` syntax, saved goals, user settings, main-session tools, completion authority, cancellation, stall limits or settlement. SDK callers can pass `{ codemode: true }` to `createSkepticVerifier`.
+
+The child adds `codemode` to the existing `read,grep,find,ls,bash` allowlist and explicitly loads `src/verifier-codemode.ts`. This tiny adapter uses Pi's public `createCodemodeExtension({ models: false, mode: "only" })`, **not a custom executor**. When opted in, only `codemode` is declared to the verifier model; the allowlisted checks remain callable as `tools.*` inside scripts. This is a code-only route, not an extra optional tool beside direct calls. The CLI's `builtin:codemode` alias exposes `models.*` by default without a CLI off switch, so the adapter avoids unintended classifier/image calls. Main-session codemode remains user-controlled and can have different capabilities. Chat verification still incurs normal model charges; bash/scripts can still call external services.
+
+Codemode guidance recommends independent reads, bounded output filtering and independent checks; shared build/database state must not be parallelized. Bash promises can resolve with nonzero exit codes: exit codes, failure output, truncation and available native log references must survive filtering. Parent script success cannot rewrite failed nested receipts.
+
+`test/codemode.test.ts` compares fixed documentation, passing/failing checks, missing-evidence and script-error fixtures using real native tools and **mocked chat responses**. It reports duration and reported mock usage, checks equal underlying tool coverage, and exercises nested cancellation, disabled `models.*` and spill references. JSON/RPC SDK lifecycle tests cover single settlement after completion, budget wrap-up and stall. These are protocol regressions, **not evidence of live-model performance gains or requirement coverage**.
+
+Historical live comparisons used the user's configured `deepseek/deepseek-flash` with the old `mode: "on"` adapter; they measured **optional tool availability, not code-only execution**. Initial `thinking=off` also did not represent the user's saved thinking setting. The adapter now uses `mode: "only"`; SDK regressions assert the model sees only the `codemode` declaration while scripts retain the exact check allowlist.
+
+The corrected live comparison uses `thinking=high` as requested, with Git baselines for unchanged-fixture requirements. Both paths matched expectations in 8/8 small cases; all code-only attempts actually used scripts (29 calls, zero direct check calls). Code-only averaged 11.11s versus 9.43s direct on these tiny fixtures, not evidence about larger batching workloads. See [UPGRADE_PLAN.md](UPGRADE_PLAN.md) for distinct measurements, excluded harness-limited runs and costs. Live requests are manual, never part of CI; historical optional-tool results are not evidence against the current code-only route. Production thinking still follows the host session, not a hardcoded benchmark level.
 
 Providers registered only by extensions and credentials supplied only to an SDK runtime are not inherited by the child. Such verifier failures remain unverified; use a physical provider/model configured in Pi's stored settings or environment.
 

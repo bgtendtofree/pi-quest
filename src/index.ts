@@ -22,6 +22,11 @@ import {
 import { captureBaseline, createSkepticVerifier, VerificationError, verificationFailure } from "./verifier.ts";
 
 const DEFAULT_MAX_TURNS = 20;
+// Sanity cap: the turn budget is the only hard stop, so a runaway value
+// (e.g. Number.MAX_SAFE_INTEGER) must never disable it.
+const MAX_TURNS_LIMIT = 1000;
+// A baseline is a git object name; validate before it reaches git argv.
+const BASELINE_PATTERN = /^[0-9a-f]{4,64}$/i;
 // Identical gap fingerprints in a row before the goal auto-pauses.
 // Two means nothing changed between attempts; iterating further is futile.
 const STALL_THRESHOLD = 2;
@@ -150,7 +155,7 @@ export interface GoalState {
 export interface GoalVerdict {
 	achieved: boolean;
 	gaps: string[];
-	/** false → every gap is non-model-fixable → blocked, pause for user. */
+	/** For unmet goals, false → every gap is non-model-fixable → blocked, pause for user. */
 	modelFixable: boolean;
 	blocker?: string;
 	/** Actual physical verifier model, when reported by the child. */
@@ -191,6 +196,7 @@ function restoreState(value: unknown): GoalState | undefined {
 		(raw.autoTurns as number) < 0 ||
 		!Number.isSafeInteger(raw.maxTurns) ||
 		(raw.maxTurns as number) <= 0 ||
+		(raw.maxTurns as number) > MAX_TURNS_LIMIT ||
 		typeof raw.suspended !== "boolean" ||
 		typeof raw.cwd !== "string" ||
 		!Number.isSafeInteger(raw.stallCount) ||
@@ -202,13 +208,27 @@ function restoreState(value: unknown): GoalState | undefined {
 		(raw.pauseReason !== undefined && typeof raw.pauseReason !== "string")
 	)
 		return undefined;
+	const statusInvalid = !isGoalStatus(raw.status);
 	const restored: GoalState = {
-		...(value as GoalState),
-		status: isGoalStatus(raw.status) ? raw.status : "user_paused",
-		...(isGoalStatus(raw.status) ? {} : { pauseReason: "invalid persisted status" }),
+		objective: raw.objective,
+		status: statusInvalid ? "user_paused" : (raw.status as GoalStatus),
+		round: raw.round as number,
+		autoTurns: raw.autoTurns as number,
+		maxTurns: raw.maxTurns as number,
+		suspended: raw.suspended as boolean,
+		cwd: raw.cwd as string,
+		stallCount: raw.stallCount as number,
+		...(typeof raw.baselineCommit === "string" && BASELINE_PATTERN.test(raw.baselineCommit)
+			? { baselineCommit: raw.baselineCommit }
+			: {}),
+		...(typeof raw.lastGapFingerprint === "string" ? { lastGapFingerprint: raw.lastGapFingerprint } : {}),
+		...(Array.isArray(raw.lastGaps) ? { lastGaps: raw.lastGaps as string[] } : {}),
+		...(statusInvalid
+			? { pauseReason: "invalid persisted status" }
+			: typeof raw.pauseReason === "string"
+				? { pauseReason: raw.pauseReason.slice(0, TEXT_LIMIT) }
+				: {}),
 	};
-	delete restored.lastVerification;
-	delete restored.accounting;
 	const accounting = restoreAccounting(raw.accounting);
 	if (accounting) restored.accounting = accounting;
 	const verification = restoreVerification(raw.lastVerification, restored.round);
@@ -304,18 +324,19 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	function transition(status: GoalStatus, reason: string | undefined, ctx: ExtensionContext): void {
 		if (!goal) return;
 		goal.status = status;
-		if (reason === undefined) delete goal.pauseReason;
-		else goal.pauseReason = reason;
+		const bounded = reason === undefined ? undefined : reason.slice(0, TEXT_LIMIT);
+		if (bounded === undefined) delete goal.pauseReason;
+		else goal.pauseReason = bounded;
 		persist();
 		syncUi(ctx);
 		if (status !== "active") {
-			ctx.ui.notify(`🎯 goal ${status.replace("_", " ")}${reason ? `: ${reason}` : ""}`, "info");
+			ctx.ui.notify(`🎯 goal ${status.replace("_", " ")}${bounded ? `: ${bounded}` : ""}`, "info");
 		}
 	}
 
 	function continuationText(): string {
 		if (!goal) return "";
-		const gaps = goal.lastGaps ?? [];
+		const gaps = boundedGaps(goal.lastGaps ?? []).gaps;
 		const gapSection = gaps.length > 0 ? `\nVerifier gaps to fix first:\n${gaps.map((g) => `- ${g}`).join("\n")}` : "";
 		return (
 			`[goal round ${goal.round}] Objective: ${goal.objective}${gapSection}\n` +
@@ -470,7 +491,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		if (flags.length > 1 || (flags.length === 1 && !match)) return undefined;
 		const maxTurns = match?.[1] ? Number.parseInt(match[1], 10) : DEFAULT_MAX_TURNS;
 		const objective = (match ? args.replace(match[0], "") : args).trim();
-		if (!objective || !Number.isSafeInteger(maxTurns) || maxTurns <= 0) return undefined;
+		if (!objective || !Number.isSafeInteger(maxTurns) || maxTurns <= 0 || maxTurns > MAX_TURNS_LIMIT) return undefined;
 		return { objective, maxTurns };
 	}
 
@@ -662,6 +683,11 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 }
 
 export default function quest(pi: ExtensionAPI): void {
+	pi.registerFlag("quest-verifier-codemode", {
+		type: "boolean",
+		default: false,
+		description: "Experimental native codemode in verifier only (models.* disabled; bash is not sandboxed)",
+	});
 	createQuest(pi, (goal, ctx) => async (objective, round, signal, report) => {
 		// Virtual selections only exist in the host's extension runtime. Reuse
 		// the physical model that did the work, including its routed effort.
@@ -678,6 +704,7 @@ export default function quest(pi: ExtensionAPI): void {
 		const model = response ? `${response.provider}/${response.model}` : undefined;
 		const thinkingLevel = response?.thinkingLevel ?? ctx.thinkingLevel;
 		return createSkepticVerifier((c, a, o) => pi.exec(c, a, o), goal, {
+			codemode: pi.getFlag("quest-verifier-codemode") === true,
 			...(model ? { model } : {}),
 			...(thinkingLevel ? { thinkingLevel } : {}),
 		})(objective, round, signal, report);

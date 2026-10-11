@@ -170,10 +170,16 @@ test("native codemode preserves failed bash receipts and accounts nested model u
 });
 
 for (const scenario of [
-	{ achievedAfter: 3, status: "complete", requests: 3 },
-	{ achievedAfter: 0, status: "budget_paused", requests: 4 },
+	{ achievedAfter: 3, status: "complete", requests: 3, mode: "json" as const },
+	{ achievedAfter: 0, status: "budget_paused", requests: 4, mode: "json" as const },
+	{ achievedAfter: 3, status: "complete", requests: 3, mode: "rpc" as const },
+	{ achievedAfter: 0, status: "budget_paused", requests: 4, mode: "rpc" as const },
+	{ achievedAfter: 0, status: "no_progress_paused", requests: 2, mode: "json" as const },
+	{ achievedAfter: 0, status: "no_progress_paused", requests: 2, mode: "rpc" as const },
 ]) {
-	test(`Pi 1.0.1 settles once after ${scenario.status}, including wrap-up`, { timeout: 10_000 }, async () => {
+	test(`Pi 1.0.1 ${scenario.mode} settles once after ${scenario.status}, including wrap-up`, {
+		timeout: 10_000,
+	}, async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "pi-quest-runtime-"));
 		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
 		try {
@@ -196,7 +202,11 @@ for (const scenario of [
 					(pi) =>
 						createQuest(pi, () => async () => {
 							verifications += 1;
-							return { achieved: verifications === scenario.achievedAfter, gaps: [], modelFixable: true };
+							return {
+								achieved: verifications === scenario.achievedAfter,
+								gaps: scenario.status === "no_progress_paused" ? ["same gap"] : [],
+								modelFixable: true,
+							};
 						}),
 				],
 			});
@@ -232,7 +242,7 @@ for (const scenario of [
 				sessionStartEvent: { type: "session_start", reason: "reload" },
 				noTools: "all",
 			}));
-			await session.bindExtensions({ mode: "json" });
+			await session.bindExtensions({ mode: scenario.mode });
 			let requests = 0;
 			session.agent.streamFunction = async (_model, context) => {
 				requests += 1;
@@ -271,7 +281,11 @@ for (const scenario of [
 			session.subscribe((event) => {
 				if (event.type === "agent_settled") {
 					settlements += 1;
-					assert.equal(verifications, 3, "settled must not precede goal completion");
+					assert.equal(
+						verifications,
+						scenario.status === "no_progress_paused" ? 2 : 3,
+						"settled must not precede goal completion",
+					);
 				}
 			});
 			await session.prompt("start", { source: "extension" });
@@ -281,13 +295,16 @@ for (const scenario of [
 				.getBranch()
 				.findLast((entry) => entry.type === "custom" && entry.customType === "pi-quest");
 			assert.equal((snapshot as { data: { status: string; autoTurns: number } }).data.status, scenario.status);
-			assert.equal((snapshot as { data: { autoTurns: number } }).data.autoTurns, 2);
+			assert.equal(
+				(snapshot as { data: { autoTurns: number } }).data.autoTurns,
+				scenario.status === "no_progress_paused" ? 1 : 2,
+			);
 			const accounting = (snapshot as { data: GoalState }).data.accounting;
 			assert.equal(accounting?.main.runs, scenario.requests);
 			assert.equal(accounting?.main.completedRuns, scenario.requests);
-			assert.equal(accounting?.verifier.runs, 3);
-			assert.equal(accounting?.verifier.completedRuns, 3);
-			assert.equal(accounting?.verifier.unreportedRuns, 3);
+			assert.equal(accounting?.verifier.runs, verifications);
+			assert.equal(accounting?.verifier.completedRuns, verifications);
+			assert.equal(accounting?.verifier.unreportedRuns, verifications);
 		} finally {
 			session?.dispose();
 			await rm(cwd, { recursive: true, force: true });

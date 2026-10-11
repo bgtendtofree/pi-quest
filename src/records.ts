@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { basename, dirname } from "node:path";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
@@ -36,6 +38,7 @@ export const AccountingSchema = Type.Object({ main: RunSchema, verifier: RunSche
 export type Accounting = Static<typeof AccountingSchema>;
 
 const Ref = Type.String({ pattern: "^sha256:[a-f0-9]{64}$" });
+const LOG_FILE_PATTERN = "^pi-(?:bash-[a-f0-9]{16}\\.log|codemode-[a-f0-9]{16}\\.txt)$";
 const ReceiptSchema = Type.Object(
 	{
 		source: Type.Union([Type.Literal("tool_execution_start"), Type.Literal("tool_execution_end")]),
@@ -45,9 +48,11 @@ const ReceiptSchema = Type.Object(
 			Type.Literal("find"),
 			Type.Literal("ls"),
 			Type.Literal("bash"),
+			Type.Literal("codemode"),
 			Type.Literal("unknown"),
 		]),
 		callRef: Ref,
+		parentRef: Type.Optional(Ref),
 		argsRef: Type.Optional(Ref),
 		outputRef: Type.Optional(Ref),
 		status: Type.Union([
@@ -59,6 +64,8 @@ const ReceiptSchema = Type.Object(
 		exitCode: Type.Optional(Type.Integer()),
 		durationMs: Type.Optional(Count),
 		outputTruncated: Type.Optional(Type.Boolean()),
+		/** Native Pi spill filename in os.tmpdir(); availability is unknown. */
+		fullOutputFile: Type.Optional(Type.String({ pattern: LOG_FILE_PATTERN, maxLength: 64 })),
 	},
 	{ additionalProperties: false },
 );
@@ -151,6 +158,10 @@ export function restoreRecords(value: unknown): VerificationRecords | undefined 
 	if (value.toolCalls !== value.omitted + value.receipts.length) return;
 	const retainedFailures = value.receipts.filter((receipt) => receipt.status === "error").length;
 	if (value.failedCalls < retainedFailures || value.failedCalls > retainedFailures + value.omitted) return;
+	// Mirror restoreAccounting: usage that claims more reports than observed
+	// responses would poison the persisted accounting and be dropped on restore.
+	const sources = value.usage.assistantResponses + value.usage.nestedUsageReports;
+	if (value.usage.tokenReports > sources || value.usage.costReports > sources) return;
 	return structuredClone(value);
 }
 
@@ -163,7 +174,8 @@ function ref(value: unknown): string {
 /**
  * Receipts come from actual CLI events, not assistant prose. Hash identifiers,
  * args and output: no new raw command/output log, credential leak, or cleanup
- * subsystem. Native Pi logs remain owned by Pi and aren't assumed readable.
+ * subsystem. Only validated native spill basenames are retained, never arbitrary
+ * paths. Native Pi logs remain owned by Pi and aren't assumed readable.
  */
 export function collectRecords(stdout: string): VerificationRecords {
 	const usage = emptyUsage();
@@ -186,13 +198,18 @@ export function collectRecords(stdout: string): VerificationRecords {
 		if (typeof event.toolCallId !== "string" || ended.has(event.toolCallId)) continue;
 		const id = event.toolCallId;
 		const prior = calls.get(id);
-		const tool = ["read", "grep", "find", "ls", "bash"].includes(event.toolName as string)
+		const tool = ["read", "grep", "find", "ls", "bash", "codemode"].includes(event.toolName as string)
 			? (event.toolName as Static<typeof ReceiptSchema>["tool"])
 			: "unknown";
 		const receipt: Static<typeof ReceiptSchema> = {
 			source: event.type,
 			tool,
 			callRef: ref(id),
+			...(typeof event.parentToolCallId === "string"
+				? { parentRef: ref(event.parentToolCallId) }
+				: prior?.parentRef
+					? { parentRef: prior.parentRef }
+					: {}),
 			...(event.args !== undefined ? { argsRef: ref(event.args) } : prior?.argsRef ? { argsRef: prior.argsRef } : {}),
 			status: "unfinished",
 		};
@@ -214,6 +231,15 @@ export function collectRecords(stdout: string): VerificationRecords {
 				receipt.durationMs = Math.round(duration * 1000);
 			if (typeof data.truncated === "boolean") receipt.outputTruncated = data.truncated;
 			if (object(details.truncation).truncated === true) receipt.outputTruncated = true;
+			const logPath = data.full_output_path ?? details.fullOutputPath;
+			if (
+				typeof logPath === "string" &&
+				dirname(logPath) === tmpdir() &&
+				new RegExp(LOG_FILE_PATTERN).test(basename(logPath))
+			) {
+				receipt.fullOutputFile = basename(logPath);
+				if (tool === "codemode") receipt.outputTruncated = true;
+			}
 			if (typeof data.output === "string") receipt.outputRef = ref(data.output);
 			else if (Array.isArray(result.content)) receipt.outputRef = ref(result.content);
 		}

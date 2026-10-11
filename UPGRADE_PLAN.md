@@ -1,6 +1,7 @@
 # pi-quest 升级计划
 
-状态：P1/P2 已实施；P3 未实施。验收以当次 `mise run ci` 和交付记录为准。
+状态：P1/P2 已实施；P3 实验接线与真实模型小样本检验已实施，尚未证明批处理收益，默认关闭。
+验收以当次 `mise run ci` 和交付记录为准。
 本文不授权安装第三方插件或修改用户 Pi 配置。
 
 ## 1. 定位与边界
@@ -138,10 +139,39 @@ P1 完成后再实施。只存排错和评估所需数据，不建 observability
 
 只有 P2 的记录足够比较开销后才实施。不是功能升级的前置条件。
 
+实施口径：
+
+- 新增调用级 `--quest-verifier-codemode`，默认 false；不修改主会话工具或用户配置，不持久化自动启用状态。
+- 子进程保持原有隔离参数、工具 allowlist 与验证路径，只显式添加 codemode。
+  `src/verifier-codemode.ts` 使用公开 `createCodemodeExtension({ models: false, mode: "only" })`。
+  启用后只向模型声明 codemode；原来的检查工具仍在 allowlist 中，通过脚本调用。
+  旧 `mode: "on"` 只是额外开放能力，不构成真正的 code-only 路径对照，已纠正。
+  不直接使用 `builtin:codemode` 别名：该别名默认开放 `models.*` 且无 CLI 关闭选项；
+  薄适配文件是关闭额外模型能力所需的最小方案，不迁移 SDK verifier 或重写执行器。
+- 回执识别 codemode，嵌套调用保留 parentRef；原生溢出日志只留经校验的 os.tmpdir 文件名引用。
+  不建日志缓存、不存原始输出、不读取/删除原生日志；缺失日志不影响目标状态。
+- `test/codemode.test.ts` 固定对照目标如下。原生工具实际执行，chat 回复与 usage 均为 mock：
+
+| 目标 | direct / codemode 结果 | 原始工具覆盖 |
+|---|---|---|
+| 文档完成 | achieved / achieved | 相同的两次读取 |
+| 文档缺少来源 | incomplete / incomplete | 相同的两次读取，不强制测试 |
+| 两项检查成功 | achieved / achieved | 相同的两项命令 |
+| 一项检查失败 | incomplete / incomplete | 相同命令，保留 exit 7 |
+| 模型只宣称成功、漏检查 | mock 判 incomplete / incomplete | 均无真实检查，回执不从文本反推 |
+| 脚本失败 | incomplete / incomplete | 原始检查仍保留，codemode 外层失败另记 |
+
+- 对照输出耗时、assistant 往返与报告 usage。mock 中批量调用可以减少往返，
+  但未包含真实模型时延、提示成本或模型选择行为，不据此宣布省钱/加速或默认上线。
+- 集成覆盖真实嵌套取消、models.* 关闭、输出溢出引用；JSON/RPC SDK 验证完成、
+  预算总结、停滞均只发一次最终 settlement。打包 smoke 检查显式 adapter 加载与无递归 goal controller。
+- 已进行用户授权的 DeepSeek Flash 小样本实测，见下节；**没有证明可重复收益，默认继续关闭。**
+
 范围：
 
 - 主会话由用户自行启用 codemode；quest 不修改全局工具选择。
-- verifier 可选显式加载 `builtin:codemode`，保留原来的工具 allowlist。
+- verifier 可选显式加载原生 codemode，保留原来的工具 allowlist；
+  需关闭 models.* 时使用上述公开 factory 适配，不直接使用默认开放模型的别名。
 - 不安装第三方 codemode，不自行实现 JS/TS 执行器。
 - 只建议批量读取、输出筛选及互不干扰的检查；共享构建目录的命令不能盲目并行。
 - 保留退出码、失败摘要和完整日志引用，不能只返回模型生成的“通过”布尔值。
@@ -163,6 +193,123 @@ P1 完成后再实施。只存排错和评估所需数据，不建 observability
 - 验证耗时、模型往返、可报告 token/费用。
 - 检查覆盖不能下降；若没有可重复的收益，继续保持默认关闭。
 - 覆盖原生嵌套工具事件、取消和 JSON/RPC 最终 settlement 的集成测试。
+
+### DeepSeek Flash / off 历史小样本（2026-10-04 UTC）
+
+**方法修正：用户保存的是 `max`，先前擅自固定 `off` 偏离实际用法。
+以下数据只适用于 off 工况，不能用于判断用户常用模式的收益，更不能据此判定 codemode 不值得用。**
+
+- 使用用户现有 Pi 配置与凭据，模型 `deepseek/deepseek-flash`，两组均 `--thinking off`。
+  不改用户配置，不启用 models.*；实际调用 `createSkepticVerifier` 与宿主 Pi 1.0.1 CLI。
+- 四类临时目标：文档齐全、缺少必需来源、代码与两项检查通过、代码错误导致测试失败。
+  文档只要求本地文档与来源引用，不要求测试或网络抓取；固定文件还含一份无证据的“全部完成”报告。
+  每次在独立目录执行，不修改仓库；本次只比较 verifier，不是整个自主循环的长程压力测试。
+- 首批两轮、交替组序，共 16 次。原解析器正确接收 direct 7/8、opt-in 6/8；
+  三次误拒均为 `achieved=true, gaps=[], model_fixable=false, blocker=null`。
+  修复仅让完成目标忽略不相关的 fixability；仍拒绝有 gaps/blocker 的完成声明。
+  原始 16 次响应用修复后解析器复核，均符合样例预期，不等同于重新调用模型。
+- 修复后再实际调用 8 次，两组各四类目标一次。目录编号不透露预期结果；
+  对提供的全部六个文件做运行前后 SHA-256 比较，8/8 未改变。以下仅统计这批新调用：
+
+| 指标 | direct（4 次） | codemode 开放（4 次） |
+|---|---:|---:|
+| verdict 符合固定样例预期 | 4/4 | 4/4 |
+| unverified / 假完成 | 0 / 0 | 0 / 0 |
+| 平均 verifier 耗时 | 8.824 秒 | 10.217 秒 |
+| assistant 回复总数 | 18 | 22 |
+| input / output tokens | 11,325 / 3,948 | 14,373 / 4,158 |
+| cache-read / cache-write tokens | 39,808 / 0 | 63,616 / 0 |
+| 报告 total tokens | 55,081 | 82,147 |
+| Pi 估算费用（USD） | 0.008374 | 0.009683 |
+| 实际 codemode 调用 | 0 | 0 |
+
+- 本批 opt-in 平均慢约 15.8%，估算费用高约 15.6%；不能当统计显著的性能结论。
+  首批反而平均快约 7.1%，但 tokens 和费用更高。缓存、网络、模型策略与提示修复均是混杂因素。
+  **“允许 codemode”不等于“强制走 codemode”**：所有 12 次 opt-in 中，仅一次真正调用它（四个脚本）。
+  所以这次主要测到能力开放后的模型行为/提示开销，未证明批处理本身收益。
+- 缺源与失败测试样例均未假完成。代码目标有检查执行记录；部分 bash 命令用输出捕获或
+  `; echo ...` 返回外层 exit 0，不能据此声称内部测试通过。verdict 仍依据实际失败输出/实现给出未完成。
+  回执的 exitCode 指外层实际工具调用，不从文字反造子命令退出码。
+- 24 次合计 Pi 估算费用约 **USD 0.054032**，按当前模型价格与服务报告 usage 计算，不是供应商账单。
+  私有原始事件和手工 harness 留在 `/tmp/pi-quest-live.Ij00Xa/`，没有复制凭据或原始输出进仓库。
+- 样本小、目标简单、只测一个模型与 off thinking；无分类器/图像调用，无强制脚本策略。
+  不据此泛化模型准确率或默认启用；需要更多真实批处理场景、受控缓存与重复测量才重新评估。
+
+### DeepSeek Flash / max / on 历史复测（2026-10-04 UTC）
+
+- 通过公开 SettingsManager 只读取思考档位：无 DeepSeek Flash 专用覆盖，保存的默认档为 `max`。
+  不指定 `--thinking` 的原生 RPC `get_state` 也确认模型为 `deepseek/deepseek-flash`、档位 `max`。
+  两组随后统一显式 `--thinking max`，其他生产 verifier 参数、目标和文件保持一致。
+- 四类目标重复两轮，交换两组顺序，先跑 16 次。手工 harness 的额外 8 次回复上限
+  提前截断两次 opt-in 代码成功样例；这是实验限制，不是生产 verifier 的失败。
+  删除这个额外上限，按生产 600 秒超时重跑受影响的**两对、共四次**。
+  原两对的全部四次结果都排除，避免只替换失败的一侧；总共付费 20 次，正式比较保留 16 次。
+- 全部 16 个完整比较结果均包含实际 thinking 块，原始六个文件的前后指纹一致。
+  没有强制模型使用 codemode，没有修改用户配置或开启 models.*。
+
+| 指标 | direct（8 次） | codemode 开放（8 次） |
+|---|---:|---:|
+| verdict 符合固定样例预期 | 8/8 | 8/8 |
+| unverified / 假完成 | 0 / 0 | 0 / 0 |
+| 平均耗时 | 21.782 秒 | 22.848 秒 |
+| assistant 回复总数 | 51 | 52 |
+| input / output tokens（output 已含 reasoning） | 40,682 / 29,526 | 40,761 / 31,700 |
+| cache-read / cache-write tokens | 216,192 / 0 | 251,136 / 0 |
+| 报告 total tokens | 286,400 | 323,597 |
+| Pi 估算费用（USD） | 0.048933 | 0.051775 |
+| 实际 thinking 块 | 48 | 51 |
+| 完整比较结果中的 codemode 调用 | 0 | 0 |
+
+- 被额外上限截断的一次 max 样例实际调用了七个 codemode 脚本，因此不能说 max 模型不会用它，
+  也不能从这些截断结果推断完成能力或公平比较耗时。其他完整小样例仍选择直接工具；
+  思考开启不保证选脚本，工具选择还受任务规模、输出大小与可用直接工具影响。
+- 正式完整比较中，开放组平均慢约 4.9%、估算费用高约 5.8%。这是可选工具开放后的行为数据，
+  **不是脚本批处理路径性能对照**，样本小且缓存/网络未控制，不代表模型普遍能力或统计显著差异。
+  不能再用 off 或本批小样例替批处理收益下结论。
+- 本批全部 20 次 Pi 估算费用 **USD 0.131589**，含排除结果；
+  加此前 off 的 24 次，总共 44 次、估算 **USD 0.185621**，均非供应商账单。
+  原始私有事件在 `/tmp/pi-quest-live.Ij00Xa/thinking-max/` 与 `max-confirm/`，
+  成对替换后的摘要在 `/tmp/pi-quest-live.Ij00Xa/thinking-max-summary.json`。
+- 默认实验开关暂不改变。下一次性能评估需实际适合批量读取/大输出筛选的目标；
+  分开衡量“允许模型选 codemode”的采纳行为与“实际脚本执行”的耗时/覆盖，
+  后续已将 adapter 改为原生 `mode: "only"`，不与本节旧 `mode: "on"` 数据混称。
+
+### DeepSeek Flash / high / code-only（2026-10-04 UTC）
+
+- 按用户要求统一 `--thinking high`，不再用 max。实验开关仍为 opt-in，但启用后的
+  adapter 改为原生 `{ models: false, mode: "only" }`：模型只看到 codemode，
+  五个检查工具只能经脚本调用。主会话工具和用户配置不变。
+- SDK 回归逐轮回放系统消息的 toolsAdded/toolsRemoved，断言 opt-in 声明仅有 codemode；
+  同时断言脚本可调用的工具仍恰好属于原 allowlist，保留嵌套父引用、失败、取消与单次 settlement。
+- 第一批 high/only 共 16 次，所有 opt-in 都真实执行脚本，但一次成功代码样例保守阻塞：
+  要求证明 fixtures 未改，却没有 baseline 可对照。先前手工样例不能把 verifier 无法获得的
+  原始文件事实当作已验证；这不是通过放宽 verifier 来修。
+- 给每个样例创建独立临时 Git 仓库与初始 commit，将 baselineCommit 传入生产 verifier。
+  两组同样具备原始内容参照；不修改目标文字、不设置回复次数限额，保持生产 600 秒超时。
+  四类目标各两轮、交替组序，完整重跑 16 次。以下只比较**有 baseline 的这批**：
+
+| 指标 | direct（8 次） | code-only（8 次） |
+|---|---:|---:|
+| verdict 符合固定样例预期 | 8/8 | 8/8 |
+| unverified / 假完成 | 0 / 0 | 0 / 0 |
+| 平均耗时 | 9.427 秒 | 11.110 秒 |
+| assistant 回复总数 | 33 | 37 |
+| input / output tokens（output 已含 reasoning） | 23,453 / 10,823 | 27,053 / 12,492 |
+| cache-read / cache-write tokens | 77,824 / 0 | 101,888 / 0 |
+| 报告 total tokens | 112,100 | 141,433 |
+| Pi 估算费用（USD） | 0.020490 | 0.023718 |
+| codemode 实际执行次数 | 0 | 29 |
+| 经脚本执行的 opt-in 样例 | — | 8/8 |
+| opt-in 绕过脚本的直接检查调用 | — | 0 |
+
+- 全部正式样例有实际 thinking 输出，六个文件前后指纹一致。缺少来源与失败测试均未假完成。
+  这是实际路径对照，不再是“是否愿意选择可选工具”的测量。
+- 这些极小目标下，code-only 平均慢约 17.9%、估算费用高约 15.7%；样本小、缓存/网络未受控，
+  不据此泛化大型批量读取或筛选任务。code-only 路径功能可用，实验开关保持可显式启用。
+- 本批有效比较估算费用 USD 0.044208；两批 high 的 32 次合计 USD 0.098999。
+  连同历史 off/max，本次累计 76 次、Pi 估算 USD 0.284619，均非供应商账单。
+  原始私有事件分别在 `/tmp/pi-quest-live.Ij00Xa/high-code-only/`（无 baseline，历史）
+  与 `high-only-baseline/`（正式比较）；不复制凭据或原始输出到仓库。
 
 ## 6. 暂缓项
 
