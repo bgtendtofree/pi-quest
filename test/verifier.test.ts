@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, test } from "node:test";
 import type { GoalState } from "../src/index.ts";
 import type { VerificationRecords } from "../src/records.ts";
 import {
 	buildSkepticPrompt,
 	captureBaseline,
+	captureWorktreeState,
 	createSkepticVerifier,
 	type ExecFn,
 	parseVerdict,
@@ -585,7 +590,60 @@ describe("skeptic worktree verification", () => {
 		assert.equal(reports[0]?.streamIncomplete, true);
 		assert.equal(reports[0]?.receipts[0]?.status, "unfinished");
 	});
+
+	test("worktree fingerprint follows untracked and staged content", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "pi-quest-worktree-"));
+		try {
+			const git = (...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
+			git("init", "-q");
+			git("config", "user.email", "test@example.com");
+			git("config", "user.name", "test");
+			await writeFile(join(cwd, "tracked.txt"), "one\n");
+			git("add", "tracked.txt");
+			git("commit", "-q", "-m", "init");
+			const exec = realExec();
+
+			await writeFile(join(cwd, "new.txt"), "draft one");
+			const first = await captureWorktreeState(exec, cwd);
+			await writeFile(join(cwd, "new.txt"), "draft two");
+			const second = await captureWorktreeState(exec, cwd);
+			assert.ok(first && second);
+			assert.notEqual(first, second, "editing an untracked file must change the fingerprint");
+
+			await writeFile(join(cwd, "tracked.txt"), "staged one\n");
+			git("add", "tracked.txt");
+			const third = await captureWorktreeState(exec, cwd);
+			await writeFile(join(cwd, "tracked.txt"), "staged two\n");
+			git("add", "tracked.txt");
+			const fourth = await captureWorktreeState(exec, cwd);
+			assert.ok(third && fourth);
+			assert.notEqual(third, fourth, "restaging different content must change the fingerprint");
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 });
+
+function realExec(): ExecFn {
+	return async (command, args, options) => {
+		try {
+			const stdout = execFileSync(command, args, {
+				cwd: options?.cwd,
+				timeout: options?.timeout,
+				encoding: "utf8",
+			});
+			return { stdout, stderr: "", code: 0, killed: false };
+		} catch (error) {
+			const failure = error as { status?: number | null; stdout?: string; stderr?: string };
+			return {
+				stdout: typeof failure.stdout === "string" ? failure.stdout : "",
+				stderr: typeof failure.stderr === "string" ? failure.stderr : "",
+				code: typeof failure.status === "number" ? failure.status : 1,
+				killed: false,
+			};
+		}
+	};
+}
 
 test("baseline capture is best-effort", async () => {
 	assert.equal(
