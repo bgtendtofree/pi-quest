@@ -245,6 +245,9 @@ export function createSkepticVerifier(
 			"--no-context-files",
 			"--no-approve",
 			"--offline",
+			// Pi 1.0.4+ keeps MCP tools reachable from codemode unless MCP is
+			// off, so the verifier's allowlist must disable MCP explicitly.
+			"--no-mcp",
 			...(options.codemode ? ["-e", fileURLToPath(new URL("./verifier-codemode.ts", import.meta.url))] : []),
 			"--tools",
 			`read,grep,find,ls,bash${options.codemode ? ",codemode" : ""}`,

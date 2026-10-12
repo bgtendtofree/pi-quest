@@ -67,7 +67,7 @@ Call IDs, arguments and output are stored only as SHA-256 fingerprints (`callRef
 - Token fields keep input/output/cache-read/cache-write/total separate; reasoning tokens are already included in output. Missing or all-zero placeholder usage stays unknown. Cost is Pi's **estimate**, not an invoice; zero estimates stay unknown because unpriced models also report zero. Known subtotals with missing reports are marked partial.
 - Unreported nested model work, compaction/branch-summary calls, cache warming and model calls made externally by scripts are outside these counters. No token/cost hard budget is enabled.
 
-The skeptic disables discovered extensions (including built-in MCP/codemode), skills, prompt templates, context files, project trust, and background network activity. Experimental codemode, below, is the only explicitly loaded exception. A failed, aborted, or truncated assistant response never completes a goal, even when JSON mode exits with code zero.
+The skeptic disables discovered extensions, skills, prompt templates, context files, project trust, built-in MCP (`--no-mcp`), and background network activity. Experimental codemode, below, is the only explicitly loaded exception. A failed, aborted, or truncated assistant response never completes a goal, even when JSON mode exits with code zero.
 
 ### Experimental verifier codemode (default off)
 
@@ -99,7 +99,7 @@ Design rationale: [pi-doom-loop docs/goal-plugin-design.md](https://github.com/b
 
 ## Install
 
-Requires Pi **1.0.1+** and Node **24+**. Development and packed-package checks target Pi 1.0.1; peer dependencies remain `"*"` per Pi's host-module contract.
+Requires Pi **1.1.0+** and Node **24+**. Development and packed-package checks target Pi 1.1.0; peer dependencies remain `"*"` per Pi's host-module contract.
 
 ```bash
 pi install git:github.com/bgtendtofree/pi-quest

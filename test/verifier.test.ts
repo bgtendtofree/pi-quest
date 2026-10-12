@@ -306,7 +306,14 @@ describe("skeptic worktree verification", () => {
 			assert.equal(command, process.execPath);
 			assert.match(args[0] ?? "", /dist[/\\]bundle[/\\]cli\.js$/);
 			assert.notEqual(args[0], process.argv[1]);
-			for (const flag of ["--offline", "--no-extensions", "--no-context-files", "--no-approve", "--no-session"]) {
+			for (const flag of [
+				"--offline",
+				"--no-mcp",
+				"--no-extensions",
+				"--no-context-files",
+				"--no-approve",
+				"--no-session",
+			]) {
 				assert.ok(args.includes(flag));
 			}
 			assert.equal(args[args.indexOf("--model") + 1], "openai/gpt-6.1-sol");

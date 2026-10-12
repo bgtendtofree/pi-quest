@@ -736,9 +736,7 @@ describe("user control", () => {
 	test("Esc abort observed at settlement pauses without rearming", async () => {
 		const f = fixture([]);
 		await f.setGoal("refactor auth");
-		await f.fire("agent_start");
-		await f.fire("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] });
-		await f.fire("agent_settled");
+		await f.fire("agent_settled", { aborted: true });
 		assert.equal(f.lastGoal()?.status, "user_paused");
 		assert.equal(f.sent.length, 1);
 	});

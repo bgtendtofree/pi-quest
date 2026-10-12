@@ -266,7 +266,6 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	let verify: GoalVerifier | undefined;
 	let goalVersion = 0;
 	let verificationAbort: AbortController | undefined;
-	let lastRunAborted = false;
 	let mainTurn: { goal: GoalState; startedAt: number } | undefined;
 	let wrapUpGoal: GoalState | undefined;
 
@@ -663,16 +662,10 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		persist();
 	});
 
-	// Esc bypasses agent_before_settle. Observe cancellation without restarting
-	// from the notification-only agent_settled hook.
-	pi.on("agent_start", () => {
-		lastRunAborted = false;
-	});
-	pi.on("agent_end", (event) => {
-		lastRunAborted = event.messages.some((message) => message.role === "assistant" && message.stopReason === "aborted");
-	});
-	pi.on("agent_settled", (_event, ctx) => {
-		if (lastRunAborted && goal?.status === "active") {
+	// Esc bypasses agent_before_settle. Pi 1.1.0 reports cancellation on the
+	// settlement event itself, so no transcript inspection is needed.
+	pi.on("agent_settled", (event, ctx) => {
+		if (event.aborted && goal?.status === "active") {
 			invalidate();
 			transition("user_paused", "agent run aborted", ctx);
 		}

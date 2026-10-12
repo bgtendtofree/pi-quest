@@ -177,7 +177,7 @@ for (const scenario of [
 	{ achievedAfter: 0, status: "no_progress_paused", requests: 2, mode: "json" as const },
 	{ achievedAfter: 0, status: "no_progress_paused", requests: 2, mode: "rpc" as const },
 ]) {
-	test(`Pi 1.0.1 ${scenario.mode} settles once after ${scenario.status}, including wrap-up`, {
+	test(`Pi 1.1.0 ${scenario.mode} settles once after ${scenario.status}, including wrap-up`, {
 		timeout: 10_000,
 	}, async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "pi-quest-runtime-"));
@@ -313,7 +313,7 @@ for (const scenario of [
 }
 
 for (const via of ["direct", "codemode"] as const) {
-	test(`quest_get_goal is read-only through ${via} in Pi 1.0.1`, { timeout: 15_000 }, async () => {
+	test(`quest_get_goal is read-only through ${via} in Pi 1.1.0`, { timeout: 15_000 }, async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "pi-quest-query-"));
 		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
 		try {

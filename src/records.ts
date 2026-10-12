@@ -226,9 +226,17 @@ export function collectRecords(stdout: string): VerificationRecords {
 						? "ok"
 						: "unknown";
 			if (exitCode !== undefined) receipt.exitCode = exitCode;
-			const duration = data.wall_time_seconds;
-			if (typeof duration === "number" && Number.isSafeInteger(Math.round(duration * 1000)) && duration >= 0)
-				receipt.durationMs = Math.round(duration * 1000);
+			// Pi 1.1.0 adds the tool's own measured execution time to the end
+			// event; prefer it over the bash result's wall time when present.
+			const wallTime = data.wall_time_seconds;
+			const duration =
+				typeof event.durationMs === "number" && Number.isFinite(event.durationMs)
+					? event.durationMs
+					: typeof wallTime === "number"
+						? wallTime * 1000
+						: undefined;
+			if (duration !== undefined && duration >= 0 && Number.isSafeInteger(Math.round(duration)))
+				receipt.durationMs = Math.round(duration);
 			if (typeof data.truncated === "boolean") receipt.outputTruncated = data.truncated;
 			if (object(details.truncation).truncated === true) receipt.outputTruncated = true;
 			const logPath = data.full_output_path ?? details.fullOutputPath;

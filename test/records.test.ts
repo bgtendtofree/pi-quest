@@ -123,6 +123,27 @@ test("receipts preserve real failures despite successful prose; usage uses final
 	assert.deepEqual(restoreRecords(records), records);
 });
 
+test("Pi 1.1.0 tool execution duration wins over the bash wall time", () => {
+	const records = collectRecords(
+		jsonl([
+			{ type: "tool_execution_start", toolCallId: "a", toolName: "bash", args: {} },
+			{
+				type: "tool_execution_end",
+				toolCallId: "a",
+				toolName: "bash",
+				isError: false,
+				durationMs: 250,
+				result: {
+					content: [{ type: "text", text: "ok" }],
+					structuredContent: { exit_code: 0, wall_time_seconds: 0.4 },
+				},
+			},
+			{ type: "agent_settled" },
+		]),
+	);
+	assert.equal(records.receipts[0]?.durationMs, 250);
+});
+
 test("incoherent usage is rejected by restoreRecords just like restoreAccounting", () => {
 	const records = collectRecords(
 		jsonl([{ type: "message_end", message: { role: "assistant", usage } }, { type: "agent_settled" }]),
