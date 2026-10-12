@@ -623,6 +623,8 @@ describe("stall detection", () => {
 		assert.equal(f.lastGoal()?.status, "active");
 		await f.settle();
 		assert.equal(f.lastGoal()?.status, "no_progress_paused");
+		assert.ok(f.notifications.some((text) => text.includes("no progress paused")));
+		assert.ok(!f.notifications.some((text) => text.includes("progress_paused")));
 		await f.settle();
 		assert.equal(f.sent.length, 2); // kickoff + one continuation, then stopped
 	});

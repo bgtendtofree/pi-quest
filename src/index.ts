@@ -322,7 +322,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 			return `🎯 r${goal.round} auto ${goal.autoTurns}/${goal.maxTurns}${suspended}`;
 		}
 		if (goal.status === "complete") return "🎯 complete";
-		return `🎯 ${goal.status.replace("_", " ")}`;
+		return `🎯 ${goal.status.replaceAll("_", " ")}`;
 	}
 
 	function syncUi(ctx: ExtensionContext): void {
@@ -342,7 +342,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		persist();
 		syncUi(ctx);
 		if (status !== "active") {
-			ctx.ui.notify(`🎯 goal ${status.replace("_", " ")}${bounded ? `: ${bounded}` : ""}`, "info");
+			ctx.ui.notify(`🎯 goal ${status.replaceAll("_", " ")}${bounded ? `: ${bounded}` : ""}`, "info");
 		}
 	}
 
