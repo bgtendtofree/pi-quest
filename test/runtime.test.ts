@@ -7,6 +7,7 @@ import {
 	createAgentSession,
 	createCodemodeExtension,
 	DefaultResourceLoader,
+	type ExtensionAPI,
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
@@ -177,7 +178,7 @@ for (const scenario of [
 	{ achievedAfter: 0, status: "no_progress_paused", requests: 2, mode: "json" as const },
 	{ achievedAfter: 0, status: "no_progress_paused", requests: 2, mode: "rpc" as const },
 ]) {
-	test(`Pi 1.1.0 ${scenario.mode} settles once after ${scenario.status}, including wrap-up`, {
+	test(`Pi 1.2.0 ${scenario.mode} settles once after ${scenario.status}, including wrap-up`, {
 		timeout: 10_000,
 	}, async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "pi-quest-runtime-"));
@@ -313,7 +314,7 @@ for (const scenario of [
 }
 
 for (const via of ["direct", "codemode"] as const) {
-	test(`quest_get_goal is read-only through ${via} in Pi 1.1.0`, { timeout: 15_000 }, async () => {
+	test(`quest_get_goal is read-only through ${via} in Pi 1.2.0`, { timeout: 15_000 }, async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "pi-quest-query-"));
 		let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
 		try {
@@ -443,3 +444,143 @@ for (const via of ["direct", "codemode"] as const) {
 		}
 	});
 }
+
+test("Pi 1.2.0 custom triggerTurn run stays busy, queues nextTurn into the same run, and settles once", {
+	timeout: 10_000,
+}, async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-quest-custom-"));
+	let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+	try {
+		const settingsManager = SettingsManager.inMemory({
+			compaction: { enabled: false },
+			retry: { enabled: false },
+			cacheWarming: "off",
+		});
+		const starts: Array<{ messageType: string; hasPrompt: boolean; busy: boolean }> = [];
+		let verifierCalls = 0;
+		let driver: ExtensionAPI | undefined;
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir: cwd,
+			settingsManager,
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+			extensionFactories: [
+				(pi) =>
+					createQuest(pi, () => async () => {
+						verifierCalls += 1;
+						return { achieved: true, gaps: [], modelFixable: true };
+					}),
+				(pi) => {
+					driver = pi;
+					pi.on("before_agent_start", (event, ctx) => {
+						starts.push({ messageType: event.messageType, hasPrompt: "prompt" in event, busy: !ctx.isIdle() });
+						if (event.messageType === "custom") {
+							// Sent while the custom run is starting (busy): must join the same run.
+							pi.sendMessage(
+								{ customType: "driver", content: "queued nextTurn", display: true },
+								{ deliverAs: "nextTurn" },
+							);
+						}
+					});
+				},
+			],
+		});
+		await resourceLoader.reload();
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(cwd, "auth.json"),
+			modelsPath: null,
+			modelsStorePath: join(cwd, "models-store.json"),
+			refreshOnCreate: false,
+		});
+		await modelRuntime.setRuntimeApiKey("openai", "test-only-no-network");
+		const model = modelRuntime.getModel("openai", "gpt-6.1-sol");
+		assert.ok(model);
+		const sessionManager = SessionManager.inMemory(cwd);
+		sessionManager.appendCustomEntry("pi-quest", {
+			objective: "verify the custom lifecycle",
+			status: "active",
+			round: 0,
+			autoTurns: 0,
+			maxTurns: 2,
+			suspended: false,
+			cwd,
+			stallCount: 0,
+		});
+		({ session } = await createAgentSession({
+			cwd,
+			agentDir: cwd,
+			modelRuntime,
+			model,
+			resourceLoader,
+			settingsManager,
+			sessionManager,
+			sessionStartEvent: { type: "session_start", reason: "reload" },
+			noTools: "all",
+		}));
+		await session.bindExtensions({ mode: "json" });
+		assert.ok(driver);
+		let requests = 0;
+		let injected = false;
+		session.agent.streamFunction = async (_model, context) => {
+			requests += 1;
+			if (JSON.stringify(context.messages).includes("queued nextTurn")) injected = true;
+			const message = {
+				role: "assistant" as const,
+				content: [{ type: "text" as const, text: `turn ${requests}` }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			};
+			return {
+				async *[Symbol.asyncIterator]() {
+					yield { type: "done" as const, reason: "stop" as const, message };
+				},
+				result: async () => message,
+			};
+		};
+		let settlements = 0;
+		let resolveSettled = () => {};
+		const settled = new Promise<void>((resolve) => {
+			resolveSettled = resolve;
+		});
+		session.subscribe((event) => {
+			if (event.type === "agent_settled") {
+				settlements += 1;
+				resolveSettled();
+			}
+		});
+		// `sendMessage` is fire-and-forget; wait for the single settlement instead.
+		driver.sendMessage({ customType: "driver", content: "custom trigger", display: true }, { triggerTurn: true });
+		await settled;
+		assert.equal(starts.length, 1, "only the custom message starts a run");
+		assert.equal(starts[0]?.messageType, "custom");
+		assert.equal(starts[0]?.hasPrompt, false, "a custom run has no user prompt");
+		assert.equal(starts[0]?.busy, true, "the session is busy while the custom run starts");
+		assert.equal(injected, true, "the nextTurn message is delivered inside the same run");
+		assert.equal(requests, 1, "the single run sees the queued message in its first model call");
+		assert.equal(settlements, 1);
+		// The goal plugin ran on the same custom lifecycle and completed once.
+		assert.equal(verifierCalls, 1, "the active goal was verified exactly once");
+		const snapshot = sessionManager
+			.getBranch()
+			.findLast((entry) => entry.type === "custom" && entry.customType === "pi-quest");
+		assert.equal((snapshot as { data: { status: string } }).data.status, "complete");
+	} finally {
+		session?.dispose();
+		await rm(cwd, { recursive: true, force: true });
+	}
+});

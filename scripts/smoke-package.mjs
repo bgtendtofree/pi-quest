@@ -71,40 +71,6 @@ try {
 	if (records.some((record) => record.type === "extension_error")) {
 		throw new Error(`Packed extension runtime error: ${output}`);
 	}
-	const adapter = join(installedPackage, "src", "verifier-codemode.ts");
-	if (!existsSync(adapter)) throw new Error("Packed verifier codemode adapter missing");
-	const childOutput = run(
-		piBinary,
-		[
-			"--offline",
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-context-files",
-			"--no-approve",
-			"--no-session",
-			"-e",
-			adapter,
-			"--tools",
-			"read,grep,find,ls,bash,codemode",
-			"--mode",
-			"rpc",
-		],
-		hostDirectory,
-		true,
-		'{"id":"child","type":"get_commands"}\n',
-	);
-	const childRecords = childOutput
-		.trim()
-		.split("\n")
-		.map((line) => JSON.parse(line));
-	const childResponse = childRecords.find((record) => record.id === "child" && record.type === "response");
-	if (!childResponse?.success || childRecords.some((record) => record.type === "extension_error")) {
-		throw new Error(`Packed verifier adapter failed to load: ${childOutput}`);
-	}
-	if (childResponse.data?.commands?.some((command) => command.name === "goal")) {
-		throw new Error("Verifier adapter loaded goal controller recursively");
-	}
 	console.log(`Packed runtime smoke passed: ${manifest.name} with Pi ${PI_VERSION} on Node ${process.versions.node}`);
 } finally {
 	rmSync(workspace, { recursive: true, force: true });

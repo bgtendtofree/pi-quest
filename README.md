@@ -5,7 +5,7 @@ Persistent goals for [Pi](https://pi.dev): set an objective and the agent keeps 
 Pairs with [pi-doom-loop](https://github.com/bgtendtofree/pi-doom-loop): doom-loop is the micro layer (same action spinning, mid-turn steer), pi-quest is the macro layer (varied actions, zero forward progress, round-boundary verification). Neither depends on the other.
 
 ```text
-/goal Migrate the auth module to JWT, all tests green --max-turns 20
+/goal Migrate the auth module to JWT, all tests green --max-turns 20 --max-tokens 500000 --max-minutes 30
 ```
 
 Then walk away. At every pre-settlement boundary the goal is verified; if it's not done, Pi's native `agent_before_settle` hook requests a continuation with the verifier's gaps. JSON/RPC clients receive `agent_settled` only after the loop stops, not between rounds. Submitting a user message suspends the loop until `/goal resume`.
@@ -13,9 +13,11 @@ Then walk away. At every pre-settlement boundary the goal is verified; if it's n
 ## Lifecycle
 
 ```text
-/goal <objective> [--max-turns N]   set (cap defaults to 20 auto-continuations)
+/goal <objective> [--max-turns N] [--max-tokens N] [--max-minutes N]   set (turn cap defaults to 20 auto-continuations)
 /goal status | pause | resume | clear
 ```
+
+`--max-tokens` and `--max-minutes` are optional per-goal caps on the **reported** counters below; a goal set without them keeps the legacy no-cap behavior. They are a **soft boundary, not a hard cost cap**: a single round and the wrap-up turn can push usage past the cap before the next check pauses it. Token budget counts main + verifier reported tokens (a lower bound: unknown usage stays unknown and never fabricates progress). Time budget counts **execution time only** — paused/idle periods are never charged. Budget is checked after the main run but before paying for a verifier, and again after the verifier; either check pauses with `budget_paused` and one wrap-up turn. Invalid, duplicate or valueless known flags are rejected and set no goal.
 
 Statuses: `active · user_paused · no_progress_paused · budget_paused · blocked · complete`.
 
@@ -23,7 +25,7 @@ Statuses: `active · user_paused · no_progress_paused · budget_paused · block
 |---|---|
 | `complete` | verifier reports achieved |
 | `no_progress_paused` | identical verifier-gap fingerprint twice in a row |
-| `budget_paused` | max continuations used; agent gets a wrap-up turn to summarize |
+| `budget_paused` | auto-continuation, reported-token or execution-time cap reached; agent gets a wrap-up turn to summarize |
 | `blocked` | verifier reports only non-model-fixable gaps |
 | `user_paused` | `/goal pause`, aborted/failed agent run, or restored from a previous session/branch |
 
@@ -39,7 +41,7 @@ Query output limits the objective to 4096 characters and each gap/reason to 512 
 
 ## Verification
 
-Every pre-settlement round spawns an **adversarial skeptic**: a fresh `pi --mode json -p --no-session` process (`src/verifier.ts`) using the host Pi installation and the physical model/thinking level of the latest successful assistant response. This follows model switches and virtual-model routing without loading the router in the child. It gets the objective plus `git diff` against the goal's baseline commit (captured at `/goal` time), re-runs the acceptance checks against the real worktree — tests, builds, scripts — and reports a strict JSON verdict:
+Every pre-settlement round runs an **adversarial skeptic** in-process through Pi's public SDK (`src/verifier.ts`): a fresh `createAgentSession` with discovery and background work disabled. Before each invocation it re-reads the latest successful assistant response from the branch and resolves that physical model and thinking level through the host's `modelRegistry`, so model switches and virtual-model routing are followed **each round** (A → B), never frozen at goal creation. A small dedicated runtime/registry carries the verifier: the model is registered as a carrier that forwards to the host registry with the caller's credential context stripped, so the host re-resolves the real key. No private API is read, the bridge marker never becomes the credential, and extension-only or SDK-only providers work. The skeptic gets the objective plus `git diff` against the goal's baseline commit (captured at `/goal` time), re-runs the acceptance checks against the real worktree — tests, builds, scripts — and reports a strict JSON verdict:
 
 ```json
 {"achieved": false, "gaps": ["3 auth tests still fail"], "model_fixable": true, "blocker": null}
@@ -55,7 +57,7 @@ These outcomes report the independent skeptic's judgment, not a deterministic pr
 
 ### Execution receipts and usage
 
-`lastVerification.records` collects **actual child CLI events**, never claims in assistant prose. It keeps at most 20 tool receipts per verification, with total/failed/omitted counts and a `streamIncomplete` flag for missing settlement, malformed JSONL or unfinished calls. Failure totals include omitted receipts. Receipts retain tool/event source, status (`ok`, `error`, `unknown`, `unfinished`), reported exit code, duration and truncation when available. Bash requires a reported zero exit code and a non-error result to receive `ok`; absent exit information remains unknown. Failed receipts stay failed even if the final verdict claims success. An unrelated failed command does not automatically veto a goal.
+`lastVerification.records` collects **actual SDK session events**, never claims in assistant prose. Because verification is in-process, the production path never parses JSONL text; `streamIncomplete` reflects missing settlement or unfinished calls, and the `malformed JSONL` case survives only in the `collectRecords(stdout)` fixture wrapper. It keeps at most 20 tool receipts per verification, with total/failed/omitted counts. Failure totals include omitted receipts. Receipts retain tool/event source, status (`ok`, `error`, `unknown`, `unfinished`), reported exit code, duration and truncation when available. Bash requires a reported zero exit code and a non-error result to receive `ok`; absent exit information remains unknown. Failed receipts stay failed even if the final verdict claims success. An unrelated failed command does not automatically veto a goal.
 
 Call IDs, arguments and output are stored only as SHA-256 fingerprints (`callRef`, `argsRef`, `outputRef`); nested calls also retain a hashed `parentRef`. These fingerprints identify received data, **not recoverable logs or proof of requirement coverage**. When Pi spills output, `fullOutputFile` retains only a validated native filename (`pi-bash-<hex>.log` or `pi-codemode-<hex>.txt`) inside Node's `os.tmpdir()`, not arbitrary paths. Availability is unknown: the file can disappear or belong to an earlier machine/session. Quest creates no full-output log cache, copies no raw command/output into receipts, and never reads or deletes native Pi logs. Native logs may contain sensitive output; retention and cleanup remain with Pi/the OS/user. Missing files do not change goal state. Summaries live in branch-local session entries; `/goal clear` clears current state, not historical entries. Delete the session file to remove its retained history.
 
@@ -65,9 +67,9 @@ Call IDs, arguments and output are stored only as SHA-256 fingerprints (`callRef
 - Verifier runs are independent verification attempts, including diff capture, child execution and parsing. Failed attempts count once. Cancelled/stale attempts retain their start count but cannot publish late duration, usage or receipts; `completedRuns < runs` marks incomplete accounting.
 - Usage sums finalized assistant messages and **reported top-level tool-result usage**, once. Streaming deltas, `turn_end`/`agent_end` transcript copies and nested tool execution events are not additional charges. Verifier usage covers every response, not just the verdict.
 - Token fields keep input/output/cache-read/cache-write/total separate; reasoning tokens are already included in output. Missing or all-zero placeholder usage stays unknown. Cost is Pi's **estimate**, not an invoice; zero estimates stay unknown because unpriced models also report zero. Known subtotals with missing reports are marked partial.
-- Unreported nested model work, compaction/branch-summary calls, cache warming and model calls made externally by scripts are outside these counters. No token/cost hard budget is enabled.
+- Unreported nested model work, compaction/branch-summary calls, cache warming and model calls made externally by scripts are outside these counters.
 
-The skeptic disables discovered extensions, skills, prompt templates, context files, project trust, built-in MCP (`--no-mcp`), and background network activity. Experimental codemode, below, is the only explicitly loaded exception. A failed, aborted, or truncated assistant response never completes a goal, even when JSON mode exits with code zero.
+The skeptic's resource loader explicitly disables extensions, skills, prompt templates and themes, and suppresses AGENTS files, `SYSTEM.md` and `APPEND_SYSTEM.md` (explicit empty prompt sources, not overrides that still read the files), so nothing from the local machine reaches the verifier. Settings run in-memory with compaction, retry and cache warming off. Experimental codemode, below, is the only explicitly loaded exception. A failed, aborted, or truncated assistant response never completes a goal.
 
 ### Experimental verifier codemode (default off)
 
@@ -79,27 +81,23 @@ pi --quest-verifier-codemode
 pi -e ./src/index.ts --quest-verifier-codemode
 ```
 
-Omit the flag to use the original verifier. It does not change `/goal` syntax, saved goals, user settings, main-session tools, completion authority, cancellation, stall limits or settlement. SDK callers can pass `{ codemode: true }` to `createSkepticVerifier`.
+Omit the flag to use the direct-tool verifier. It does not change `/goal` syntax, saved goals, user settings, main-session tools, completion authority, cancellation, stall limits or settlement. SDK callers can pass `{ codemode: true }` to `createSkepticVerifier`.
 
-The child adds `codemode` to the existing `read,grep,find,ls,bash` allowlist and explicitly loads `src/verifier-codemode.ts`. This tiny adapter uses Pi's public `createCodemodeExtension({ models: false, mode: "only" })`, **not a custom executor**. When opted in, only `codemode` is declared to the verifier model; the allowlisted checks remain callable as `tools.*` inside scripts. This is a code-only route, not an extra optional tool beside direct calls. The CLI's `builtin:codemode` alias exposes `models.*` by default without a CLI off switch, so the adapter avoids unintended classifier/image calls. Main-session codemode remains user-controlled and can have different capabilities. Chat verification still incurs normal model charges; bash/scripts can still call external services.
+When opted in, `codemode` is added to the exact `read,grep,find,ls,bash` allowlist and Pi's public `createCodemodeExtension({ models: false, mode: "only" })` is loaded into the verifier's resource loader — **no custom executor and no extra adapter file**. Only `codemode` is declared to the model; the allowlisted checks remain callable as `tools.*` inside scripts. `models: false` removes the `models.*` global so no classifier/image call is possible. There is no multi-layer denylist: the exact tools allowlist is the whole surface. Main-session codemode remains user-controlled and can have different capabilities. Chat verification still incurs normal model charges; bash/scripts can still call external services.
 
 Codemode guidance recommends independent reads, bounded output filtering and independent checks; shared build/database state must not be parallelized. Bash promises can resolve with nonzero exit codes: exit codes, failure output, truncation and available native log references must survive filtering. Parent script success cannot rewrite failed nested receipts.
 
-`test/codemode.test.ts` compares fixed documentation, passing/failing checks, missing-evidence and script-error fixtures using real native tools and **mocked chat responses**. It reports duration and reported mock usage, checks equal underlying tool coverage, and exercises nested cancellation, disabled `models.*` and spill references. JSON/RPC SDK lifecycle tests cover single settlement after completion, budget wrap-up and stall. These are protocol regressions, **not evidence of live-model performance gains or requirement coverage**.
+`test/verifier.test.ts` drives a real `ModelRegistry` with a fake provider and **real tool execution**: a direct `bash` call is allowed and its result returns to the model; a `codemode` call made while opted out is not callable; with codemode on, `tools.bash({ command: 'exit 7' })` keeps the nested nonzero exit, `typeof models` is `undefined`, and usage is counted once; oversized codemode output spills to a validated native `pi-codemode-*.txt` with `outputTruncated` set and the snapshot stays bounded; and cancelling a codemode script during a real nested `bash` (marker file, not a guessed delay) yields `AbortError`, exactly one partial report, `streamIncomplete`, a nested bash receipt, and no late re-report. It also asserts the actual receipt ledger (`tool: "bash"`, `status: "error"`, `exitCode: 7`), that cancelling during setup spends no provider call, that a provider ignoring abort stays bounded by the timeout, and that local `SYSTEM.md`/`APPEND_SYSTEM.md`/`AGENTS.md` sentinels never reach the prompt. These are protocol regressions, **not evidence of live-model performance gains or requirement coverage**.
 
-Historical live comparisons used the user's configured `deepseek/deepseek-flash` with the old `mode: "on"` adapter; they measured **optional tool availability, not code-only execution**. Initial `thinking=off` also did not represent the user's saved thinking setting. The adapter now uses `mode: "only"`; SDK regressions assert the model sees only the `codemode` declaration while scripts retain the exact check allowlist.
+Historical live comparisons used the user's configured `deepseek/deepseek-flash` with the old `mode: "on"` adapter; they measured **optional tool availability, not code-only execution**. The current route uses `mode: "only"`; regressions assert the model sees only the `codemode` declaration while scripts retain the exact check allowlist. Live requests are manual, never part of CI. Production thinking follows the host session, not a hardcoded benchmark level.
 
-The corrected live comparison uses `thinking=high` as requested, with Git baselines for unchanged-fixture requirements. Both paths matched expectations in 8/8 small cases; all code-only attempts actually used scripts (29 calls, zero direct check calls). Code-only averaged 11.11s versus 9.43s direct on these tiny fixtures, not evidence about larger batching workloads. See [UPGRADE_PLAN.md](UPGRADE_PLAN.md) for distinct measurements, excluded harness-limited runs and costs. Live requests are manual, never part of CI; historical optional-tool results are not evidence against the current code-only route. Production thinking still follows the host session, not a hardcoded benchmark level.
-
-Providers registered only by extensions and credentials supplied only to an SDK runtime are not inherited by the child. Such verifier failures remain unverified; use a physical provider/model configured in Pi's stored settings or environment.
-
-**Safety:** the skeptic's tools omit `edit` and `write`, but `bash` and existing check scripts can still modify files or access credentials/network. Prompt instructions and `--no-approve` are not a sandbox. Run untrusted repositories inside an isolated environment.
+**Safety:** the skeptic's tools omit `edit` and `write`, but `bash` and existing check scripts can still modify files or access credentials/network. Prompt instructions are not a sandbox. The verifier runs **in-process** with a timeout (default 10 minutes); on timeout or cancellation it aborts and detaches (reports the partial run and disposes the session), but it cannot forcibly kill a `bash` child or a `streamSimple` provider that ignores the abort signal — that work can outlive the detached verifier. Run untrusted repositories inside an isolated environment.
 
 Design rationale: [pi-doom-loop docs/goal-plugin-design.md](https://github.com/bgtendtofree/pi-doom-loop/blob/main/docs/goal-plugin-design.md).
 
 ## Install
 
-Requires Pi **1.1.0+** and Node **24+**. Development and packed-package checks target Pi 1.1.0; peer dependencies remain `"*"` per Pi's host-module contract.
+Requires Pi **1.1.0+** and Node **24+**. Development and packed-package checks target Pi 1.2.0; peer dependencies remain `"*"` per Pi's host-module contract.
 
 ```bash
 pi install git:github.com/bgtendtofree/pi-quest

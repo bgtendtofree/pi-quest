@@ -15,6 +15,7 @@ import quest, {
 } from "../src/index.ts";
 import { collectRecords } from "../src/records.ts";
 import { VerificationError } from "../src/verifier.ts";
+import { gitExec, makeHarness } from "./skeptic-harness.ts";
 
 interface Sent {
 	content: string;
@@ -310,6 +311,218 @@ describe("execution accounting", () => {
 	});
 });
 
+describe("reported budgets", () => {
+	const usage = {
+		input: 10,
+		output: 2,
+		cacheRead: 3,
+		cacheWrite: 1,
+		totalTokens: 16,
+		cost: { total: 0.01 },
+	};
+	const verifierRecords = collectRecords(
+		[
+			JSON.stringify({ type: "message_end", message: { role: "assistant", usage } }),
+			JSON.stringify({ type: "agent_settled" }),
+		].join("\n"),
+	);
+
+	test("token and time flags parse, strip from the objective, and reject invalid values", async () => {
+		const ok = fixture([]);
+		await ok.setGoal("refactor auth --max-tokens 5000 --max-minutes=30");
+		assert.equal(ok.lastGoal()?.maxTokens, 5000);
+		assert.equal(ok.lastGoal()?.maxMinutes, 30);
+		assert.equal(ok.lastGoal()?.objective, "refactor auth");
+
+		for (const value of ["0", "-1", "1.5", "abc", "1000000001", "10 --max-tokens 20"]) {
+			const bad = fixture([]);
+			await bad.setGoal(`refactor auth --max-tokens ${value}`);
+			assert.equal(bad.lastGoal(), undefined, `max-tokens ${value}`);
+		}
+		for (const value of ["0", "-3", "1.5", "abc", "100001", "5 --max-minutes 6"]) {
+			const bad = fixture([]);
+			await bad.setGoal(`refactor auth --max-minutes ${value}`);
+			assert.equal(bad.lastGoal(), undefined, `max-minutes ${value}`);
+		}
+	});
+
+	test("an already exhausted token budget pauses before paying for a verifier", async () => {
+		let verifierCalls = 0;
+		const f = fixture([notDone()], {
+			verifier: async () => {
+				verifierCalls += 1;
+				return notDone();
+			},
+		});
+		await f.setGoal("refactor auth --max-tokens 10");
+		await f.fire("turn_start");
+		await f.fire("turn_end", { message: { role: "assistant", usage }, toolResults: [] });
+		const result = await f.settle();
+		assert.equal(verifierCalls, 0, "no verifier turn is paid for after the budget is used up");
+		assert.equal(f.lastGoal()?.status, "budget_paused");
+		assert.match(f.sent.at(-1)?.content ?? "", /Budget paused/);
+		assert.ok(result?.continue);
+	});
+
+	test("a verifier-reported budget pauses after the round, not before it", async () => {
+		let verifierCalls = 0;
+		const f = fixture([], {
+			verifier: async (_objective, _round, _signal, report) => {
+				verifierCalls += 1;
+				report?.(verifierRecords);
+				return notDone();
+			},
+		});
+		await f.setGoal("refactor auth --max-tokens 10");
+		// Main usage is a lower bound of 0, so the preflight passes and the verifier runs.
+		await f.settle();
+		assert.equal(verifierCalls, 1);
+		assert.equal(f.lastGoal()?.status, "budget_paused");
+		assert.match(f.sent.at(-1)?.content ?? "", /Budget paused/);
+	});
+
+	test("an exhausted execution-time budget pauses without waiting", async () => {
+		const source = fixture([notDone()]);
+		await source.setGoal("refactor auth --max-turns 5");
+		await source.fire("turn_start");
+		await source.fire("turn_end", { message: { role: "assistant", usage }, toolResults: [] });
+		const state = structuredClone(source.lastGoal());
+		assert.ok(state?.accounting);
+		state.maxMinutes = 1;
+		state.accounting.main.durationMs = 120_000;
+		let verifierCalls = 0;
+		const restored = fixture([notDone()], {
+			entries: [{ customType: "pi-quest", data: state }],
+			branchEntries: [{ customType: "pi-quest", data: state }],
+			verifier: async () => {
+				verifierCalls += 1;
+				return notDone();
+			},
+		});
+		await restored.fire("session_start");
+		await restored.cmd("resume");
+		await restored.settle();
+		assert.equal(verifierCalls, 0);
+		assert.equal(restored.lastGoal()?.status, "budget_paused");
+		assert.match(restored.lastGoal()?.pauseReason ?? "", /execution time budget/);
+	});
+
+	test("unknown usage stays a reported lower bound and never pauses", async () => {
+		const f = fixture([notDone()], { verifier: async () => notDone() });
+		await f.setGoal("refactor auth --max-tokens 1000");
+		await f.settle();
+		assert.equal(f.lastGoal()?.status, "active");
+		assert.match(f.statuses.at(-1) ?? "", /budget reported tokens >=0\/1000/);
+		assert.equal(f.lastGoal()?.accounting?.verifier.usage.totalTokens, undefined);
+	});
+
+	test("a fully reported token total is still shown as a lower bound", async () => {
+		const f = fixture([notDone()], {
+			verifier: async (_objective, _round, _signal, report) => {
+				report?.(verifierRecords);
+				return notDone();
+			},
+		});
+		await f.setGoal("refactor auth --max-tokens 1000");
+		await f.fire("turn_start");
+		await f.fire("turn_end", { message: { role: "assistant", usage }, toolResults: [] });
+		await f.settle();
+		assert.equal(f.lastGoal()?.status, "active");
+		// 16 main + 16 verifier tokens, both reported, yet the figure stays a lower bound:
+		// external/unreported work is never included.
+		assert.match(f.statuses.at(-1) ?? "", /budget reported tokens >=32\/1000/);
+	});
+
+	test("goals without the new limits keep the legacy behavior", async () => {
+		const f = fixture([notDone()]);
+		await f.setGoal("refactor auth");
+		await f.settle();
+		const view = await f.query();
+		assert.equal(view.goal?.maxTokens, undefined);
+		assert.equal(view.goal?.maxMinutes, undefined);
+		assert.equal(f.lastGoal()?.status, "active");
+		assert.doesNotMatch(f.statuses.at(-1) ?? "", /budget/);
+	});
+
+	test("limits round-trip through restore, and invalid limits drop the whole state", async () => {
+		const source = fixture([notDone()]);
+		await source.setGoal("refactor auth --max-tokens 5000 --max-minutes 30");
+		const state = structuredClone(source.lastGoal());
+		assert.ok(state);
+		const entries = [{ customType: "pi-quest", data: state }];
+		const restored = fixture([], { entries, branchEntries: entries });
+		await restored.fire("session_start");
+		const view = await restored.query();
+		assert.equal(view.goal?.maxTokens, 5000);
+		assert.equal(view.goal?.maxMinutes, 30);
+		const invalid = fixture([], {
+			entries: [{ customType: "pi-quest", data: { ...state, maxTokens: -1 } }],
+			branchEntries: [{ customType: "pi-quest", data: { ...state, maxTokens: -1 } }],
+		});
+		await invalid.fire("session_start");
+		assert.deepEqual(await invalid.query(), { goal: null });
+	});
+
+	test("resuming a goal already at the continuation cap refuses and charges no later turn", async () => {
+		const source = fixture([notDone()]);
+		await source.setGoal("finish docs --max-turns 1");
+		await source.fire("turn_start");
+		await source.fire("turn_end", { message: { role: "assistant", usage }, toolResults: [] });
+		const state = structuredClone(source.lastGoal());
+		assert.ok(state);
+		state.status = "user_paused";
+		state.autoTurns = 1; // === maxTurns, so continuation() must refuse
+		const entries = [{ customType: "pi-quest", data: state }];
+		const f = fixture([], { entries, branchEntries: entries });
+		await f.fire("session_start");
+		await f.cmd("resume");
+		assert.equal(f.sent.length, 0, "resume past the cap must not queue a continuation");
+		assert.equal(f.lastGoal()?.status, "budget_paused");
+		const runs = f.lastGoal()?.accounting?.main.runs;
+		assert.equal(typeof runs, "number");
+		// A later unrelated turn must not be charged to the paused goal; this fails
+		// if continuation() re-arms wrapUpGoal while refusing.
+		await f.fire("turn_start");
+		await f.fire("turn_end", { message: { role: "assistant", usage }, toolResults: [] });
+		assert.equal(f.lastGoal()?.accounting?.main.runs, runs);
+		assert.equal(f.lastGoal()?.status, "budget_paused");
+	});
+
+	test("only the requested wrap-up turn is charged after a budget pause", async () => {
+		const f = fixture([], {
+			verifier: async (_objective, _round, _signal, report) => {
+				report?.(verifierRecords);
+				return notDone();
+			},
+		});
+		await f.setGoal("refactor auth --max-tokens 10");
+		await f.settle();
+		assert.equal(f.lastGoal()?.status, "budget_paused");
+		const runsAfterPause = f.lastGoal()?.accounting?.main.runs ?? 0;
+		// The explicit wrap-up turn is charged once.
+		await f.fire("turn_start");
+		await f.fire("turn_end", { message: { role: "assistant", usage }, toolResults: [] });
+		const runsAfterWrapUp = f.lastGoal()?.accounting?.main.runs ?? 0;
+		assert.equal(runsAfterWrapUp, runsAfterPause + 1);
+		// A later unrelated turn is never charged to the paused goal.
+		await f.fire("turn_start");
+		await f.fire("turn_end", { message: { role: "assistant", usage }, toolResults: [] });
+		assert.equal(f.lastGoal()?.accounting?.main.runs, runsAfterWrapUp);
+		assert.equal(f.lastGoal()?.status, "budget_paused");
+	});
+
+	test("the acceptance summary is surfaced as untrusted context and in status", async () => {
+		const f = fixture([
+			{ achieved: false, gaps: ["missing tests"], modelFixable: true, summary: "Auth is wired but unverified." },
+		]);
+		await f.setGoal("refactor auth");
+		await f.settle();
+		assert.match(f.sent.at(-1)?.content ?? "", /UNTRUSTED acceptance summary:\nAuth is wired but unverified\./);
+		await f.cmd("status");
+		assert.match(f.notifications.at(-1) ?? "", /Acceptance summary: Auth is wired but unverified\./);
+	});
+});
+
 describe("goal query and verification summaries", () => {
 	test("query is read-only, detached, and explicitly reports no goal", async () => {
 		const f = fixture([notDone(["tests fail"])]);
@@ -474,57 +687,85 @@ describe("goal query and verification summaries", () => {
 });
 
 for (const codemode of [false, true]) {
-	test(`default verifier follows physical model with codemode ${codemode ? "opt-in" : "off"}`, async () => {
-		const { pi, handlers, commands } = createPi();
-		pi.registerFlag = (name, options) => {
-			assert.equal(name, "quest-verifier-codemode");
-			assert.equal(options.default, false);
-		};
-		pi.getFlag = (name) => {
-			assert.equal(name, "quest-verifier-codemode");
-			return codemode;
-		};
-		let spawned = false;
-		pi.exec = async (command, args) => {
-			if (command === "git") return { stdout: "abc123", stderr: "", code: 0, killed: false };
-			spawned = true;
-			assert.equal(args[args.indexOf("--model") + 1], "openai/gpt-6.1-sol");
-			assert.equal(args[args.indexOf("--thinking") + 1], "high");
-			assert.equal(args.includes("-e"), codemode);
-			assert.equal(args[args.indexOf("--tools") + 1], `read,grep,find,ls,bash${codemode ? ",codemode" : ""}`);
-			if (codemode) assert.match(args[args.indexOf("-e") + 1] ?? "", /verifier-codemode\.ts$/);
-			return {
-				stdout: JSON.stringify({
-					type: "message_end",
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: '{"achieved": true, "gaps": []}' }],
-						stopReason: "stop",
-					},
-				}),
-				stderr: "",
-				code: 0,
-				killed: false,
+	test(`default verifier runs the physical model in-process with codemode ${codemode ? "on" : "off"}`, async () => {
+		const harness = await makeHarness({});
+		try {
+			const { pi, commands, handlers, sent, entries } = createPi();
+			pi.registerFlag = (name, options) => {
+				assert.equal(name, "quest-verifier-codemode");
+				assert.equal(options.default, false);
 			};
-		};
+			pi.getFlag = (name) => {
+				assert.equal(name, "quest-verifier-codemode");
+				return codemode;
+			};
+			pi.exec = gitExec({ diff: "some diff" });
+			quest(pi);
+			const ctx = {
+				cwd: harness.dir,
+				modelRegistry: harness.registry,
+				model: harness.model,
+				ui: { setStatus: () => {}, notify: () => {} },
+				hasPendingMessages: () => false,
+				sessionManager: {
+					getBranch: () => [
+						{
+							type: "message",
+							message: {
+								role: "assistant",
+								provider: "fake",
+								model: "fake-model",
+								stopReason: "stop",
+							},
+						},
+					],
+				},
+			};
+			await commands.get("goal")?.("refactor auth", ctx as never);
+			for (const handler of handlers.get("agent_before_settle") ?? []) {
+				await handler(
+					{ entries: [], continue: false, context: { pendingMessages: [] }, outcome: "completed" } as never,
+					ctx as never,
+				);
+			}
+			// The default factory routed the round to the physical model exactly once.
+			assert.equal(harness.calls.length, 1);
+			assert.equal(harness.calls[0]?.apiKey, "real-host-key");
+			assert.equal(harness.calls[0]?.model, "fake/fake-model");
+			assert.equal(/"codemode"/.test(harness.calls[0]?.text ?? ""), codemode);
+			// A real round happened: the goal either continued or paused, never silently idle.
+			assert.ok(sent.length >= 1);
+			assert.ok(entries.some((entry) => entry.customType === "pi-quest"));
+		} finally {
+			harness.dispose();
+		}
+	});
+}
+
+test("the default factory bounds an oversized verdict summary before persistence and query", async () => {
+	const longSummary = "s".repeat(5_000);
+	const harness = await makeHarness({
+		reply: () => ({
+			text: `\`\`\`json\n{"achieved": false, "gaps": [], "model_fixable": true, "summary": "${longSummary}"}\n\`\`\``,
+		}),
+	});
+	try {
+		const { pi, commands, handlers, entries, tools } = createPi();
+		pi.registerFlag = () => {};
+		pi.getFlag = () => false;
+		pi.exec = gitExec({ diff: "some diff" });
 		quest(pi);
 		const ctx = {
-			cwd: "/tmp/quest-test",
-			model: { api: "pi-virtual", provider: "router", id: "auto" },
-			thinkingLevel: "low",
+			cwd: harness.dir,
+			modelRegistry: harness.registry,
+			model: harness.model,
 			ui: { setStatus: () => {}, notify: () => {} },
 			hasPendingMessages: () => false,
 			sessionManager: {
 				getBranch: () => [
 					{
 						type: "message",
-						message: {
-							role: "assistant",
-							provider: "openai",
-							model: "gpt-6.1-sol",
-							thinkingLevel: "high",
-							stopReason: "stop",
-						},
+						message: { role: "assistant", provider: "fake", model: "fake-model", stopReason: "stop" },
 					},
 				],
 			},
@@ -536,9 +777,108 @@ for (const codemode of [false, true]) {
 				ctx as never,
 			);
 		}
-		assert.equal(spawned, true);
-	});
-}
+		const persisted = entries.filter((entry) => entry.customType === "pi-quest").at(-1)?.data as
+			| { lastVerification?: { summary?: string } }
+			| undefined;
+		assert.equal(persisted?.lastVerification?.summary?.length, 2_000, "persisted summary is capped at 2000 chars");
+		const tool = tools.get("quest_get_goal");
+		assert.ok(tool);
+		const result = await tool.execute("query", {}, undefined, undefined as never, ctx as never);
+		const view = JSON.parse((result.content[0] as { text: string }).text) as {
+			goal: { lastVerification?: { summary?: string } } | null;
+		};
+		assert.equal(
+			view.goal?.lastVerification?.summary?.length,
+			2_000,
+			"the query path exposes only the bounded summary",
+		);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test("a known response the registry cannot resolve fails as model without falling back", async () => {
+	const harness = await makeHarness({});
+	try {
+		const { pi, commands, handlers } = createPi();
+		pi.registerFlag = () => {};
+		pi.getFlag = () => false;
+		pi.exec = gitExec({});
+		quest(pi);
+		const notifications: string[] = [];
+		const ctx = {
+			cwd: harness.dir,
+			modelRegistry: harness.registry,
+			// A valid fallback the factory must NOT use while a response names another model.
+			model: harness.model,
+			ui: { setStatus: () => {}, notify: (text: string) => notifications.push(text) },
+			hasPendingMessages: () => false,
+			sessionManager: {
+				getBranch: () => [
+					{
+						type: "message",
+						message: { role: "assistant", provider: "ghost", model: "ghost-model", stopReason: "stop" },
+					},
+				],
+			},
+		};
+		await commands.get("goal")?.("refactor auth", ctx as never);
+		const result = (await handlers.get("agent_before_settle")?.[0]?.(
+			{ entries: [], continue: false, context: { pendingMessages: [] }, outcome: "completed" } as never,
+			ctx as never,
+		)) as BoundaryResult | undefined;
+		// No provider turn: the factory refused to substitute the unrelated fallback model.
+		assert.equal(harness.calls.length, 0);
+		// Fail-open: the round continues, it never silently completes.
+		assert.equal(result?.continue, true);
+		assert.match(notifications.join("\n"), /goal set/);
+		assert.doesNotMatch(notifications.join("\n"), /goal complete/);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test("the verifier re-reads the routed model and effort at each round (A to B)", async () => {
+	const harness = await makeHarness({ extraModels: ["fake-model-b"] });
+	try {
+		const { pi, commands, handlers } = createPi();
+		pi.registerFlag = () => {};
+		pi.getFlag = () => false;
+		pi.exec = gitExec({ diff: "some diff" });
+		quest(pi);
+		let route = { provider: "fake", model: "fake-model", thinkingLevel: "low" };
+		const ctx = {
+			cwd: harness.dir,
+			modelRegistry: harness.registry,
+			model: harness.model,
+			ui: { setStatus: () => {}, notify: () => {} },
+			hasPendingMessages: () => false,
+			sessionManager: {
+				getBranch: () => [{ type: "message", message: { role: "assistant", ...route, stopReason: "stop" } }],
+			},
+		};
+		const settle = () =>
+			handlers.get("agent_before_settle")?.[0]?.(
+				{ entries: [], continue: false, context: { pendingMessages: [] }, outcome: "completed" } as never,
+				ctx as never,
+			);
+		await commands.get("goal")?.("refactor auth --max-turns 5", ctx as never);
+		await settle();
+		// The user switches the routed model and effort mid-goal; the next round follows.
+		route = { provider: "fake", model: "fake-model-b", thinkingLevel: "high" };
+		await settle();
+		assert.deepEqual(
+			harness.calls.map((call) => call.model),
+			["fake/fake-model", "fake/fake-model-b"],
+		);
+		assert.deepEqual(
+			harness.calls.map((call) => call.reasoning),
+			["low", "high"],
+		);
+	} finally {
+		harness.dispose();
+	}
+});
 
 describe("loop", () => {
 	test("setting a goal kicks off work immediately", async () => {

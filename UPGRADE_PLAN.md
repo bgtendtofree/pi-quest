@@ -94,7 +94,7 @@ P1 完成后再实施。只存排错和评估所需数据，不建 observability
 
 实施口径：
 
-- `lastVerification.records` 采集真实子进程 JSONL 工具事件，每次最多保留 20 条；
+- `lastVerification.records` 采集真实 SDK session 事件（当前在宿主进程内验证；不再有子进程 JSONL 解析），每次最多保留 20 条；
   缺失退出码、未完成调用、事件流缺失、输出截断均不伪装成通过。
 - 调用、参数、输出只保留 SHA-256 指纹，非可恢复日志路径；
   不持久化原始命令、stdout、stderr 或原生日志路径。
@@ -142,17 +142,16 @@ P1 完成后再实施。只存排错和评估所需数据，不建 observability
 实施口径：
 
 - 新增调用级 `--quest-verifier-codemode`，默认 false；不修改主会话工具或用户配置，不持久化自动启用状态。
-- 子进程保持原有隔离参数、工具 allowlist 与验证路径，只显式添加 codemode。
-  `src/verifier-codemode.ts` 使用公开 `createCodemodeExtension({ models: false, mode: "only" })`。
-  启用后只向模型声明 codemode；原来的检查工具仍在 allowlist 中，通过脚本调用。
+- 验证器当前在宿主进程内经 Pi 公开 SDK（`createAgentSession` + 公开 `ResourceLoader`）运行，不再派生 CLI 子进程，也不再需要 `src/verifier-codemode.ts` 适配文件：codemode 直接通过 `resourceLoader` 的 `extensionFactories` 加载公开 `createCodemodeExtension({ models: false, mode: "only" })`。
+  原有隔离（禁用扩展/skills/prompt templates/themes/AGENTS/SYSTEM.md/APPEND_SYSTEM.md、内存 settings、关闭 compaction/retry/cache warming）保持不变；启用后只向模型声明 codemode，原来的检查工具仍在 allowlist 中，通过脚本调用。
   旧 `mode: "on"` 只是额外开放能力，不构成真正的 code-only 路径对照，已纠正。
-  不直接使用 `builtin:codemode` 别名：该别名默认开放 `models.*` 且无 CLI 关闭选项；
-  薄适配文件是关闭额外模型能力所需的最小方案，不迁移 SDK verifier 或重写执行器。
+  不直接使用 `builtin:codemode` 别名：该别名默认开放 `models.*` 且无 CLI 关闭选项；公开 factory 的 `models: false` 是关闭额外模型能力所需的最小方案。
 - 回执识别 codemode，嵌套调用保留 parentRef；原生溢出日志只留经校验的 os.tmpdir 文件名引用。
   不建日志缓存、不存原始输出、不读取/删除原生日志；缺失日志不影响目标状态。
-- `test/codemode.test.ts` 固定对照目标如下。原生工具实际执行，chat 回复与 usage 均为 mock：
+- `test/verifier.test.ts` 使用真实 `ModelRegistry` + 假 provider 与真实原生工具执行，覆盖当前 SDK 路径：单一 transport 使用真实凭据、runtime-only key 覆盖 provider placeholder、无本地 SYSTEM.md/APPEND_SYSTEM.md/AGENTS.md 哨兵、初始化取消不发起 provider 调用、已取消信号零调用、超时边界、usage 只计一次、codemode 工具面开/关、allowlist 外工具不可调用、codemode 嵌套 `tools.bash` 保留 exit 7 / `models` 关闭 / 回执账本（`tool:"bash"`, `status:"error"`, `exitCode:7`）、git 失败/未跟踪/超大 diff 仍进入提示、非 stop/无法解析判 unverified、失败分类不泄漏 provider 消息。
+- 下表的 direct/codemode fixture 对照属于**历史 CLI 子进程实现**（`pi --mode json` + `src/verifier-codemode.ts`；测试文件 `test/codemode.test.ts` 已删除），**不代表当前覆盖**，仅作归档：
 
-| 目标 | direct / codemode 结果 | 原始工具覆盖 |
+| 历史目标（CLI 子进程，已移除） | direct / codemode 结果 | 原始工具覆盖 |
 |---|---|---|
 | 文档完成 | achieved / achieved | 相同的两次读取 |
 | 文档缺少来源 | incomplete / incomplete | 相同的两次读取，不强制测试 |
@@ -161,10 +160,10 @@ P1 完成后再实施。只存排错和评估所需数据，不建 observability
 | 模型只宣称成功、漏检查 | mock 判 incomplete / incomplete | 均无真实检查，回执不从文本反推 |
 | 脚本失败 | incomplete / incomplete | 原始检查仍保留，codemode 外层失败另记 |
 
-- 对照输出耗时、assistant 往返与报告 usage。mock 中批量调用可以减少往返，
+- 历史对照输出耗时、assistant 往返与报告 usage。mock 中批量调用可以减少往返，
   但未包含真实模型时延、提示成本或模型选择行为，不据此宣布省钱/加速或默认上线。
-- 集成覆盖真实嵌套取消、models.* 关闭、输出溢出引用；JSON/RPC SDK 验证完成、
-  预算总结、停滞均只发一次最终 settlement。打包 smoke 检查显式 adapter 加载与无递归 goal controller。
+- 当前集成覆盖 `models.*` 关闭、嵌套工具回执、输出溢出引用（超大 codemode 输出落到经校验的原生 `pi-codemode-*.txt`，快照保持有界）与嵌套取消（在真实嵌套 `bash` 执行中按 marker 取消：AbortError + 一次 partial report + `streamIncomplete` + 无迟到重报）。下表的 direct/codemode 结果对照仍属历史 CLI 子进程覆盖。JSON/RPC SDK 验证完成、
+  预算总结、停滞均只发一次最终 settlement。打包 smoke 检查显式扩展加载与无递归 goal controller。
 - 已进行用户授权的 DeepSeek Flash 小样本实测，见下节；**没有证明可重复收益，默认继续关闭。**
 
 范围：

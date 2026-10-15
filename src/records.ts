@@ -172,94 +172,130 @@ function ref(value: unknown): string {
 }
 
 /**
- * Receipts come from actual CLI events, not assistant prose. Hash identifiers,
+ * Receipts come from actual Pi events, not assistant prose. Hash identifiers,
  * args and output: no new raw command/output log, credential leak, or cleanup
  * subsystem. Only validated native spill basenames are retained, never arbitrary
  * paths. Native Pi logs remain owned by Pi and aren't assumed readable.
+ *
+ * Both the JSONL fixture wrapper and the in-process subscriber share one event
+ * reducer so receipts stay identical whichever transport produced the events.
  */
-export function collectRecords(stdout: string): VerificationRecords {
-	const usage = emptyUsage();
-	const calls = new Map<string, Static<typeof ReceiptSchema>>();
-	const ended = new Set<string>();
-	let settled = false;
-	let malformed = false;
-	for (const line of stdout.split("\n")) {
-		if (!line.trim()) continue;
-		let event: Record<string, unknown>;
-		try {
-			event = object(JSON.parse(line));
-		} catch {
-			malformed = true;
-			continue;
+interface RecordsState {
+	usage: UsageTotals;
+	calls: Map<string, Static<typeof ReceiptSchema>>;
+	ended: Set<string>;
+	settled: boolean;
+	malformed: boolean;
+}
+
+function newRecordsState(): RecordsState {
+	return { usage: emptyUsage(), calls: new Map(), ended: new Set(), settled: false, malformed: false };
+}
+
+function applyRecordEvent(state: RecordsState, event: Record<string, unknown>): void {
+	const { calls, ended } = state;
+	if (event.type === "agent_settled") state.settled = true;
+	if (event.type === "message_end" && !event.parentToolCallId) recordUsage(state.usage, event.message);
+	if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return;
+	if (typeof event.toolCallId !== "string" || ended.has(event.toolCallId)) return;
+	const id = event.toolCallId;
+	const prior = calls.get(id);
+	const tool = ["read", "grep", "find", "ls", "bash", "codemode"].includes(event.toolName as string)
+		? (event.toolName as Static<typeof ReceiptSchema>["tool"])
+		: "unknown";
+	const receipt: Static<typeof ReceiptSchema> = {
+		source: event.type,
+		tool,
+		callRef: ref(id),
+		...(typeof event.parentToolCallId === "string"
+			? { parentRef: ref(event.parentToolCallId) }
+			: prior?.parentRef
+				? { parentRef: prior.parentRef }
+				: {}),
+		...(event.args !== undefined ? { argsRef: ref(event.args) } : prior?.argsRef ? { argsRef: prior.argsRef } : {}),
+		status: "unfinished",
+	};
+	if (event.type === "tool_execution_end") {
+		ended.add(id);
+		const result = object(event.result);
+		const data = object(result.structuredContent);
+		const details = object(result.details);
+		const exitCode = Number.isSafeInteger(data.exit_code) ? (data.exit_code as number) : undefined;
+		receipt.status =
+			event.isError === true || result.isError === true || (exitCode !== undefined && exitCode !== 0)
+				? "error"
+				: event.isError === false && Array.isArray(result.content) && (tool !== "bash" || exitCode === 0)
+					? "ok"
+					: "unknown";
+		if (exitCode !== undefined) receipt.exitCode = exitCode;
+		// Pi reports the tool's own measured execution time on the end event; it
+		// is absent only when the tool did not run.
+		const duration = event.durationMs;
+		if (
+			typeof duration === "number" &&
+			Number.isFinite(duration) &&
+			duration >= 0 &&
+			Number.isSafeInteger(Math.round(duration))
+		)
+			receipt.durationMs = Math.round(duration);
+		if (typeof data.truncated === "boolean") receipt.outputTruncated = data.truncated;
+		if (object(details.truncation).truncated === true) receipt.outputTruncated = true;
+		const logPath = data.full_output_path ?? details.fullOutputPath;
+		if (
+			typeof logPath === "string" &&
+			dirname(logPath) === tmpdir() &&
+			new RegExp(LOG_FILE_PATTERN).test(basename(logPath))
+		) {
+			receipt.fullOutputFile = basename(logPath);
+			if (tool === "codemode") receipt.outputTruncated = true;
 		}
-		if (event.type === "agent_settled") settled = true;
-		if (event.type === "message_end" && !event.parentToolCallId) recordUsage(usage, event.message);
-		if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") continue;
-		if (typeof event.toolCallId !== "string" || ended.has(event.toolCallId)) continue;
-		const id = event.toolCallId;
-		const prior = calls.get(id);
-		const tool = ["read", "grep", "find", "ls", "bash", "codemode"].includes(event.toolName as string)
-			? (event.toolName as Static<typeof ReceiptSchema>["tool"])
-			: "unknown";
-		const receipt: Static<typeof ReceiptSchema> = {
-			source: event.type,
-			tool,
-			callRef: ref(id),
-			...(typeof event.parentToolCallId === "string"
-				? { parentRef: ref(event.parentToolCallId) }
-				: prior?.parentRef
-					? { parentRef: prior.parentRef }
-					: {}),
-			...(event.args !== undefined ? { argsRef: ref(event.args) } : prior?.argsRef ? { argsRef: prior.argsRef } : {}),
-			status: "unfinished",
-		};
-		if (event.type === "tool_execution_end") {
-			ended.add(id);
-			const result = object(event.result);
-			const data = object(result.structuredContent);
-			const details = object(result.details);
-			const exitCode = Number.isSafeInteger(data.exit_code) ? (data.exit_code as number) : undefined;
-			receipt.status =
-				event.isError === true || result.isError === true || (exitCode !== undefined && exitCode !== 0)
-					? "error"
-					: event.isError === false && Array.isArray(result.content) && (tool !== "bash" || exitCode === 0)
-						? "ok"
-						: "unknown";
-			if (exitCode !== undefined) receipt.exitCode = exitCode;
-			// Pi 1.1.0 reports the tool's own measured execution time on the end
-			// event; it is absent only when the tool did not run.
-			const duration = event.durationMs;
-			if (
-				typeof duration === "number" &&
-				Number.isFinite(duration) &&
-				duration >= 0 &&
-				Number.isSafeInteger(Math.round(duration))
-			)
-				receipt.durationMs = Math.round(duration);
-			if (typeof data.truncated === "boolean") receipt.outputTruncated = data.truncated;
-			if (object(details.truncation).truncated === true) receipt.outputTruncated = true;
-			const logPath = data.full_output_path ?? details.fullOutputPath;
-			if (
-				typeof logPath === "string" &&
-				dirname(logPath) === tmpdir() &&
-				new RegExp(LOG_FILE_PATTERN).test(basename(logPath))
-			) {
-				receipt.fullOutputFile = basename(logPath);
-				if (tool === "codemode") receipt.outputTruncated = true;
-			}
-			if (typeof data.output === "string") receipt.outputRef = ref(data.output);
-			else if (Array.isArray(result.content)) receipt.outputRef = ref(result.content);
-		}
-		calls.set(id, receipt);
+		if (typeof data.output === "string") receipt.outputRef = ref(data.output);
+		else if (Array.isArray(result.content)) receipt.outputRef = ref(result.content);
 	}
+	calls.set(id, receipt);
+}
+
+function finalizeRecords(state: RecordsState): VerificationRecords {
+	const calls = state.calls;
 	const receipts = [...calls.values()].slice(-20);
 	return {
 		toolCalls: calls.size,
 		failedCalls: [...calls.values()].filter((call) => call.status === "error").length,
 		omitted: calls.size - receipts.length,
-		streamIncomplete: !settled || malformed || [...calls.values()].some((call) => call.status === "unfinished"),
+		streamIncomplete:
+			!state.settled || state.malformed || [...calls.values()].some((call) => call.status === "unfinished"),
 		receipts,
-		usage,
+		usage: state.usage,
+	};
+}
+
+/** Fixture wrapper: parse a child JSONL event stream into bounded records. */
+export function collectRecords(stdout: string): VerificationRecords {
+	const state = newRecordsState();
+	for (const line of stdout.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			applyRecordEvent(state, object(JSON.parse(line)));
+		} catch {
+			state.malformed = true;
+		}
+	}
+	return finalizeRecords(state);
+}
+
+/** Production path: consume native structured events directly, no JSONL round-trip. */
+export function createRecordsCollector(): {
+	event: (event: unknown) => void;
+	finish: () => VerificationRecords;
+} {
+	const state = newRecordsState();
+	return {
+		event(event) {
+			applyRecordEvent(state, object(event));
+		},
+		finish() {
+			return finalizeRecords(state);
+		},
 	};
 }
 
