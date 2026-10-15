@@ -19,13 +19,7 @@ import {
 	restoreRecords,
 	type VerificationRecords,
 } from "./records.ts";
-import {
-	captureBaseline,
-	captureWorktreeState,
-	createSkepticVerifier,
-	VerificationError,
-	verificationFailure,
-} from "./verifier.ts";
+import { captureBaseline, createSkepticVerifier, VerificationError, verificationFailure } from "./verifier.ts";
 
 const DEFAULT_MAX_TURNS = 20;
 // Sanity cap: the turn budget is the only hard stop, so a runaway value
@@ -149,8 +143,6 @@ export interface GoalState {
 	baselineCommit?: string;
 	lastGapFingerprint?: string;
 	lastGaps?: string[];
-	/** Worktree fingerprint at the last real verification; an identical tree skips the next skeptic. */
-	lastVerifiedState?: string;
 	stallCount: number;
 	/** Human-readable why, set on paused-family transitions. */
 	pauseReason?: string;
@@ -211,7 +203,6 @@ function restoreState(value: unknown): GoalState | undefined {
 		(raw.stallCount as number) < 0 ||
 		(raw.baselineCommit !== undefined && typeof raw.baselineCommit !== "string") ||
 		(raw.lastGapFingerprint !== undefined && typeof raw.lastGapFingerprint !== "string") ||
-		(raw.lastVerifiedState !== undefined && typeof raw.lastVerifiedState !== "string") ||
 		(raw.lastGaps !== undefined &&
 			(!Array.isArray(raw.lastGaps) || !raw.lastGaps.every((gap) => typeof gap === "string"))) ||
 		(raw.pauseReason !== undefined && typeof raw.pauseReason !== "string")
@@ -232,9 +223,6 @@ function restoreState(value: unknown): GoalState | undefined {
 			: {}),
 		...(typeof raw.lastGapFingerprint === "string" ? { lastGapFingerprint: raw.lastGapFingerprint } : {}),
 		...(Array.isArray(raw.lastGaps) ? { lastGaps: raw.lastGaps as string[] } : {}),
-		...(typeof raw.lastVerifiedState === "string" && raw.lastVerifiedState.length <= 64
-			? { lastVerifiedState: raw.lastVerifiedState }
-			: {}),
 		...(statusInvalid
 			? { pauseReason: "invalid persisted status" }
 			: typeof raw.pauseReason === "string"
@@ -317,11 +305,11 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	function statusText(): string {
 		if (!goal) return "";
 		if (goal.status === "active") {
-			const suspended = goal.suspended ? " ⏸ typing-suspended" : "";
-			return `🎯 r${goal.round} auto ${goal.autoTurns}/${goal.maxTurns}${suspended}`;
+			const suspended = goal.suspended ? " (typing-suspended)" : "";
+			return `goal r${goal.round} auto ${goal.autoTurns}/${goal.maxTurns}${suspended}`;
 		}
-		if (goal.status === "complete") return "🎯 complete";
-		return `🎯 ${goal.status.replaceAll("_", " ")}`;
+		if (goal.status === "complete") return "goal complete";
+		return `goal ${goal.status.replaceAll("_", " ")}`;
 	}
 
 	function syncUi(ctx: ExtensionContext): void {
@@ -341,7 +329,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		persist();
 		syncUi(ctx);
 		if (status !== "active") {
-			ctx.ui.notify(`🎯 goal ${status.replaceAll("_", " ")}${bounded ? `: ${bounded}` : ""}`, "info");
+			ctx.ui.notify(`goal ${status.replaceAll("_", " ")}${bounded ? `: ${bounded}` : ""}`, "info");
 		}
 	}
 
@@ -397,38 +385,11 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		const signal = ctx.signal ? AbortSignal.any([controller.signal, ctx.signal]) : controller.signal;
 		try {
 			settledGoal.round += 1;
-			// A round that leaves the worktree byte-identical to the last verified
-			// state cannot change the verdict, so skip the 1-2 min skeptic. Gap
-			// wording can drift between runs; the tree cannot.
-			const priorVerification = settledGoal.lastVerification;
-			let worktreeState: string | undefined;
-			if (settledVerify) {
-				worktreeState = await captureWorktreeState((c, a, o) => pi.exec(c, a, o), settledGoal.cwd, signal);
-			}
-			if (
-				worktreeState !== undefined &&
-				worktreeState === settledGoal.lastVerifiedState &&
-				priorVerification?.outcome === "verified-incomplete"
-			) {
-				const gaps = boundedGaps(settledGoal.lastGaps ?? []);
-				settledGoal.lastVerification = {
-					outcome: "verified-incomplete",
-					round: settledGoal.round,
-					durationMs: 0,
-					...gaps,
-					...(priorVerification.model ? { model: priorVerification.model } : {}),
-				};
-				settledGoal.stallCount += 1;
-				if (settledGoal.stallCount >= STALL_THRESHOLD) {
-					transition("no_progress_paused", "worktree unchanged since the last verification", ctx);
-					return;
-				}
-				persist();
-				const skipText = continuation(ctx);
-				return skipText ? boundaryContinuation(event, skipText) : undefined;
-			}
+			// Every round runs a fresh skeptic. Worktree state is not a sound skip
+			// signal: ignored files and external state (for example dependencies
+			// fixed by `npm ci`) can change the verdict while Git is unchanged.
 			// The skeptic runs 1-2 min; without this the UI looks hung (live-test lesson).
-			ctx.ui.setStatus("pi-quest", `🎯 r${settledGoal.round} verifying…`);
+			ctx.ui.setStatus("pi-quest", `goal r${settledGoal.round} verifying…`);
 
 			// Fail-open: a broken verifier never blocks or silently completes the
 			// goal. The round counts as unverified, the loop continues.
@@ -464,7 +425,6 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 				return;
 			}
 			finishRun(accounting.verifier, performance.now() - startedAt, records?.usage ?? emptyUsage());
-			if (verdict && worktreeState) settledGoal.lastVerifiedState = worktreeState;
 			if (ctx.hasPendingMessages()) {
 				persist();
 				return;
@@ -571,7 +531,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 			}
 			if (sub === "resume") {
 				if (goal?.status === "budget_paused") {
-					ctx.ui.notify("🎯 budget exhausted; set a new goal", "warning");
+					ctx.ui.notify("budget exhausted; set a new goal", "warning");
 					return;
 				}
 				if (goal && (isPaused(goal.status) || goal.suspended)) {
@@ -579,7 +539,6 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 					goal.suspended = false;
 					goal.stallCount = 0;
 					delete goal.lastGapFingerprint;
-					delete goal.lastVerifiedState;
 					verify = makeVerifier(goal, ctx);
 					transition("active", undefined, ctx);
 					const text = continuation(ctx);
@@ -595,7 +554,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 				goal = undefined;
 				verify = undefined;
 				syncUi(ctx);
-				ctx.ui.notify("🎯 goal cleared", "info");
+				ctx.ui.notify("goal cleared", "info");
 				return;
 			}
 			if (sub === "help" || !args.trim()) {
@@ -615,6 +574,9 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 			const version = invalidate();
 			goal = undefined;
 			verify = undefined;
+			// Drop the previous goal's status now: captureBaseline may await, and a
+			// cancelled replacement must not leave the old goal in the UI.
+			syncUi(ctx);
 			const baselineCommit = await captureBaseline((c, a, o) => pi.exec(c, a, o), ctx.cwd);
 			if (goalVersion !== version) return;
 			goal = {
@@ -631,7 +593,7 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 			verify = makeVerifier(goal, ctx);
 			persist();
 			syncUi(ctx);
-			ctx.ui.notify(`🎯 goal set (cap ${goal.maxTurns} auto-continuations)`, "info");
+			ctx.ui.notify(`goal set (cap ${goal.maxTurns} auto-continuations)`, "info");
 			pi.sendUserMessage(`[goal] Objective: ${goal.objective}\nStart working toward it now.`, {
 				deliverAs: "followUp",
 			});
@@ -676,7 +638,14 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 	// plugin or other extensions do not look like human input.
 	pi.on("input", (event, ctx) => {
 		if (event.source === "extension") return;
-		if (goal?.status === "active" && !goal.suspended) {
+		// Human input cancels an in-flight goal creation even before the goal
+		// exists: otherwise a delayed baseline capture would arm a stale
+		// objective after the user already redirected the agent.
+		if (goal === undefined) {
+			invalidate();
+			return;
+		}
+		if (goal.status === "active" && !goal.suspended) {
 			invalidate();
 			goal.suspended = true;
 			persist();
@@ -711,10 +680,11 @@ export function createQuest(pi: ExtensionAPI, makeVerifier: GoalVerifierFactory)
 		syncUi(ctx);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		invalidate();
 		goal = undefined;
 		verify = undefined;
+		syncUi(ctx);
 	});
 }
 

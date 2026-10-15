@@ -22,7 +22,7 @@ Statuses: `active · user_paused · no_progress_paused · budget_paused · block
 | Exit | Trigger |
 |---|---|
 | `complete` | verifier reports achieved |
-| `no_progress_paused` | identical verifier-gap fingerprint twice in a row, or an unchanged worktree since the last verification |
+| `no_progress_paused` | identical verifier-gap fingerprint twice in a row |
 | `budget_paused` | max continuations used; agent gets a wrap-up turn to summarize |
 | `blocked` | verifier reports only non-model-fixable gaps |
 | `user_paused` | `/goal pause`, aborted/failed agent run, or restored from a previous session/branch |
@@ -45,7 +45,7 @@ Every pre-settlement round spawns an **adversarial skeptic**: a fresh `pi --mode
 {"achieved": false, "gaps": ["3 auth tests still fail"], "model_fixable": true, "blocker": null}
 ```
 
-`achieved` completes the goal; `gaps` are inlined into the next continuation; `model_fixable: false` blocks it for a human decision. Identical gap sets twice in a row (normalized fingerprint) trip the no-progress pause, and so does an **unchanged worktree** (same HEAD + status + diff as the last real verification): the skeptic is skipped and the round counts as no progress. A skeptic that crashes, times out (10 min), or returns unparseable output is **fail-open**: the round counts as unverified and the loop continues — an internal failure never blocks or silently completes a goal. A blocked verdict with neither gaps nor a named blocker is incoherent and is treated as unverified too.
+`achieved` completes the goal; `gaps` are inlined into the next continuation; `model_fixable: false` blocks it for a human decision. Identical gap sets twice in a row (normalized fingerprint) trip the no-progress pause. Every round runs a fresh skeptic: worktree state is not a skip signal, because ignored files and external state (for example dependencies fixed by `npm ci`) can change the verdict while Git is unchanged. A skeptic that crashes, times out (10 min), or returns unparseable output is **fail-open**: the round counts as unverified and the loop continues — an internal failure never blocks or silently completes a goal. A blocked verdict with neither gaps nor a named blocker is incoherent and is treated as unverified too.
 
 The skeptic is instructed to assess **every objective requirement** as verified, unverified, or unmet before its final JSON verdict. A passing test is not proof of the entire objective. Documentation and research goals are checked against their actual deliverables; they do not require a test command merely to complete.
 

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -324,48 +323,6 @@ export async function captureBaseline(exec: ExecFn, cwd: string): Promise<string
 		const result = await exec("git", ["rev-parse", "HEAD"], { cwd, timeout: 10_000 });
 		const sha = result.stdout.trim();
 		return result.code === 0 && sha ? sha : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Fingerprint of the worktree at a point in time (HEAD + status + tracked diff
- * + untracked contents). Two equal fingerprints mean nothing changed, so
- * re-running the skeptic cannot change the verdict. Best-effort: undefined
- * outside a git repo or on failure.
- */
-export async function captureWorktreeState(
-	exec: ExecFn,
-	cwd: string,
-	signal?: AbortSignal,
-): Promise<string | undefined> {
-	try {
-		const opts = { cwd, timeout: 10_000, ...(signal ? { signal } : {}) };
-		const head = await exec("git", ["rev-parse", "HEAD"], opts);
-		if (head.code !== 0 || head.killed) return undefined;
-		const status = await exec("git", ["status", "--porcelain", "--untracked-files=all"], opts);
-		if (status.code !== 0 || status.killed) return undefined;
-		// `git diff HEAD` covers staged and unstaged edits to tracked files;
-		// bare `git diff` misses staged content, so restaging looks unchanged.
-		const diff = await exec("git", ["diff", "HEAD", "--no-ext-diff", "--no-textconv", "--"], opts);
-		if (diff.code !== 0 || diff.killed) return undefined;
-		// status lists untracked names only and diff omits them, so an agent
-		// editing only a new file would look unchanged and stall. Hash their
-		// contents explicitly.
-		const untracked = await exec("git", ["ls-files", "--others", "--exclude-standard", "-z"], opts);
-		if (untracked.code !== 0 || untracked.killed) return undefined;
-		const paths = untracked.stdout.split("\u0000").filter(Boolean);
-		let untrackedHashes = "";
-		if (paths.length > 0) {
-			const hashed = await exec("git", ["hash-object", "--", ...paths], opts);
-			if (hashed.code !== 0 || hashed.killed) return undefined;
-			untrackedHashes = hashed.stdout;
-		}
-		return createHash("sha256")
-			.update(`${head.stdout.trim()}\u0000${status.stdout}\u0000${diff.stdout}\u0000${untrackedHashes}`)
-			.digest("hex")
-			.slice(0, 32);
 	} catch {
 		return undefined;
 	}

@@ -767,6 +767,7 @@ describe("user control", () => {
 			assert.equal(f.sent.length, 1);
 			assert.notEqual(f.lastGoal()?.status, "complete");
 			assert.equal((await f.query()).goal?.lastVerification, undefined);
+			assert.doesNotMatch(f.statuses.at(-1) ?? "", /verifying/);
 		}
 	});
 
@@ -820,6 +821,83 @@ describe("user control", () => {
 		await setting;
 		assert.equal(f.sent.length, 0);
 		assert.equal(f.lastGoal()?.status, "cleared");
+	});
+
+	test("human input during delayed baseline capture cancels goal creation", async () => {
+		let resolveExec!: (result: Awaited<ReturnType<ExtensionAPI["exec"]>>) => void;
+		const f = fixture([], {
+			exec: () =>
+				new Promise((resolve) => {
+					resolveExec = resolve;
+				}),
+		});
+		await f.fire("session_start", { reason: "startup" });
+		const setting = f.cmd("refactor auth --max-turns 3");
+		await Promise.resolve();
+		await f.userTypes();
+		resolveExec({ stdout: "abc123", stderr: "", code: 0, killed: false });
+		await setting;
+		assert.equal(f.lastGoal(), undefined, "a stale objective must not arm after human input");
+		assert.equal(f.sent.length, 0, "no kickoff and no restart after the human redirect");
+	});
+
+	test("a cancelled replacement clears the old goal status before the baseline resolves", async () => {
+		let calls = 0;
+		let resolveExec!: (result: Awaited<ReturnType<ExtensionAPI["exec"]>>) => void;
+		const f = fixture([], {
+			exec: () => {
+				calls += 1;
+				if (calls === 1) return Promise.resolve({ stdout: "abc123", stderr: "", code: 0, killed: false });
+				return new Promise((resolve) => {
+					resolveExec = resolve;
+				});
+			},
+		});
+		await f.setGoal("old");
+		assert.match(f.statuses.at(-1) ?? "", /goal r0/);
+		const setting = f.cmd("new");
+		assert.equal(f.statuses.at(-1), undefined, "replacement clears the old status before the baseline await");
+		await f.userTypes();
+		resolveExec({ stdout: "abc123", stderr: "", code: 0, killed: false });
+		await setting;
+		assert.deepEqual(await f.query(), { goal: null });
+		assert.equal(f.sent.length, 1, "only the old kickoff; the cancelled replacement sends nothing");
+		assert.equal(f.statuses.at(-1), undefined);
+	});
+
+	test("a cancelled replacement clears a stale verifying status before the baseline resolves", async () => {
+		let releaseVerifier!: () => void;
+		let calls = 0;
+		let resolveExec!: (result: Awaited<ReturnType<ExtensionAPI["exec"]>>) => void;
+		const f = fixture([], {
+			verifier: async () => {
+				await new Promise<void>((resolve) => {
+					releaseVerifier = resolve;
+				});
+				return notDone();
+			},
+			exec: () => {
+				calls += 1;
+				if (calls === 1) return Promise.resolve({ stdout: "abc123", stderr: "", code: 0, killed: false });
+				return new Promise((resolve) => {
+					resolveExec = resolve;
+				});
+			},
+		});
+		await f.setGoal("old");
+		const settling = f.settle();
+		await Promise.resolve();
+		assert.match(f.statuses.at(-1) ?? "", /verifying/);
+		const setting = f.cmd("new");
+		assert.equal(f.statuses.at(-1), undefined, "replacement clears the verifying status before the baseline await");
+		await f.userTypes();
+		resolveExec({ stdout: "abc123", stderr: "", code: 0, killed: false });
+		releaseVerifier();
+		await settling;
+		await setting;
+		assert.deepEqual(await f.query(), { goal: null });
+		assert.equal(f.sent.length, 1);
+		assert.equal(f.statuses.at(-1), undefined);
 	});
 });
 
@@ -1055,30 +1133,26 @@ describe("persistence discipline", () => {
 		assert.equal(f.entries.length, afterSet + 1, "turn_end is the single write");
 	});
 
-	test("an unchanged worktree skips the skeptic and pauses as no progress", async () => {
+	test("git-identical rounds still run a fresh skeptic and can complete", async () => {
 		let verified = 0;
-		const exec = ((_command: string, args: string[]) =>
-			Promise.resolve(
-				args.includes("rev-parse")
-					? { stdout: "abc123\n", stderr: "", code: 0, killed: false }
-					: { stdout: "", stderr: "", code: 0, killed: false },
-			)) as ExtensionAPI["exec"];
+		// Stable git output: under the removed shortcut this fingerprint would
+		// have matched and skipped the second skeptic. Every round must verify.
+		const exec = (() => Promise.resolve({ stdout: "", stderr: "", code: 0, killed: false })) as ExtensionAPI["exec"];
 		const f = fixture([], {
 			exec,
 			verifier: async () => {
 				verified += 1;
-				return notDone(["still broken"]);
+				return verified === 1 ? notDone(["still broken"]) : { achieved: true, gaps: [], modelFixable: true };
 			},
 		});
 		await f.setGoal("refactor auth");
 		await f.settle();
 		assert.equal(verified, 1);
 		assert.equal(f.lastGoal()?.status, "active");
-		assert.ok(f.lastGoal()?.lastVerifiedState, "fingerprint stored after a real verification");
+		assert.equal("lastVerifiedState" in (f.lastGoal() ?? {}), false, "no worktree fingerprint is persisted");
 		await f.settle();
-		assert.equal(verified, 1, "identical worktree skips the skeptic");
-		assert.equal(f.lastGoal()?.status, "no_progress_paused");
-		assert.match(f.lastGoal()?.pauseReason ?? "", /unchanged/);
+		assert.equal(verified, 2, "identical git state still runs the skeptic");
+		assert.equal(f.lastGoal()?.status, "complete");
 	});
 
 	test("restored state drops unknown keys and unvalidated baselines", async () => {
@@ -1116,5 +1190,32 @@ describe("persistence discipline", () => {
 		const f = fixture([], { entries: [{ customType: "pi-quest", data: stored }] });
 		await f.setGoal("status");
 		assert.equal(f.lastGoal(), undefined);
+	});
+});
+
+describe("plain-text UI", () => {
+	// Status text and notifications must stay readable without emoji; state is
+	// carried by words, not pictographs.
+	const EMOJI = /\p{Extended_Pictographic}|\uFE0F|\u20E3/u;
+
+	test("status and notifications contain no emoji", async () => {
+		const completed = fixture([{ achieved: true, gaps: [], modelFixable: true }]);
+		await completed.setGoal("document API");
+		await completed.userTypes();
+		await completed.cmd("resume");
+		await completed.settle();
+
+		const budget = fixture([notDone(["gap a"]), notDone(["gap b"])]);
+		await budget.setGoal("refactor auth --max-turns 1");
+		await budget.settle();
+		await budget.settle();
+		await budget.cmd("clear");
+
+		const texts = [...completed.statuses, ...completed.notifications, ...budget.statuses, ...budget.notifications];
+		assert.ok(texts.some((text) => text !== undefined));
+		for (const text of texts) {
+			if (text === undefined) continue;
+			assert.doesNotMatch(text, EMOJI, `emoji in UI text: ${text}`);
+		}
 	});
 });
